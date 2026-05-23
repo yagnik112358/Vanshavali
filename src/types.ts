@@ -4,6 +4,15 @@
  */
 
 export type Gender = 'male' | 'female' | 'other';
+export type SpouseStatus = 'current' | 'former' | 'widowed';
+
+export interface SpouseRelation {
+  personId: string;
+  status?: SpouseStatus;
+  startDate?: string | null;
+  endDate?: string | null;
+  childrenIds?: string[];
+}
 
 export interface Person {
   id: string;
@@ -20,6 +29,7 @@ export interface Person {
   // Helpers for mapping UI state
   birthPlace?: string;
   occupation?: string;
+  spouses?: SpouseRelation[];
 }
 
 export interface TreeFilterOptions {

@@ -4,8 +4,9 @@
  */
 
 import React, { useState, useEffect } from 'react';
-import { Person, Gender } from '../types';
-import { X, Save, Trash2, HelpCircle } from 'lucide-react';
+import { Person, Gender, SpouseRelation, SpouseStatus } from '../types';
+import { uploadPersonPhoto } from '../lib/db';
+import { X, Save, Trash2, Upload, Image as ImageIcon } from 'lucide-react';
 
 interface MemberEditModalProps {
   person: Person | null; // Null means adding a new person
@@ -34,6 +35,9 @@ export default function MemberEditModal({
   const [dob, setDob] = useState('');
   const [dod, setDod] = useState('');
   const [photourl, setPhotourl] = useState('');
+  const [photoFile, setPhotoFile] = useState<File | null>(null);
+  const [uploadingPhoto, setUploadingPhoto] = useState(false);
+  const [photoUploadError, setPhotoUploadError] = useState('');
   const [notes, setNotes] = useState('');
   const [birthPlace, setBirthPlace] = useState('');
   const [occupation, setOccupation] = useState('');
@@ -42,12 +46,16 @@ export default function MemberEditModal({
   const [fatherid, setFatherid] = useState<string>('');
   const [motherid, setMotherid] = useState<string>('');
   const [spouseid, setSpouseid] = useState<string>('');
+  const [spouseRelations, setSpouseRelations] = useState<SpouseRelation[]>([]);
 
   const [errors, setErrors] = useState<{ [key: string]: string }>({});
 
   useEffect(() => {
     if (isOpen) {
       setErrors({});
+      setPhotoFile(null);
+      setPhotoUploadError('');
+      setUploadingPhoto(false);
       if (person) {
         // Editing existing person
         setName(person.name || '');
@@ -61,6 +69,7 @@ export default function MemberEditModal({
         setFatherid(person.fatherid || '');
         setMotherid(person.motherid || '');
         setSpouseid(person.spouseid || '');
+        setSpouseRelations(normalizeSpouseRelations(person.spouses, person.spouseid));
       } else {
         // Adding new person
         setName('');
@@ -74,6 +83,7 @@ export default function MemberEditModal({
         setFatherid('');
         setMotherid('');
         setSpouseid('');
+        setSpouseRelations([]);
 
         // Apply pre-fill relationship presets if they were requested (e.g. from context quick buttons)
         if (relationPreset) {
@@ -82,6 +92,7 @@ export default function MemberEditModal({
           if (relative) {
             if (type === 'spouse') {
               setSpouseid(relativeId);
+              setSpouseRelations([{ personId: relativeId, status: 'current', startDate: null, endDate: null, childrenIds: [] }]);
               // Oppose gender standard preset for couples
               setGender(relative.gender === 'male' ? 'female' : 'male');
             } else if (type === 'child') {
@@ -140,7 +151,66 @@ export default function MemberEditModal({
   const mothers = eligiblePeople.filter(p => p.gender === 'female');
   const spouses = eligiblePeople; // Spouses can be any gender
 
-  const handleSubmit = (e: React.FormEvent) => {
+  function normalizeSpouseRelations(relations: SpouseRelation[] | undefined, fallbackSpouseId?: string | null): SpouseRelation[] {
+    const relationMap = new Map<string, SpouseRelation>();
+
+    (relations || []).forEach(relation => {
+      if (!relation.personId) return;
+      relationMap.set(relation.personId, {
+        personId: relation.personId,
+        status: relation.status || 'current',
+        startDate: relation.startDate || null,
+        endDate: relation.endDate || null,
+        childrenIds: Array.from(new Set(relation.childrenIds || [])),
+      });
+    });
+
+    if (fallbackSpouseId && !relationMap.has(fallbackSpouseId)) {
+      relationMap.set(fallbackSpouseId, {
+        personId: fallbackSpouseId,
+        status: 'current',
+        startDate: null,
+        endDate: null,
+        childrenIds: [],
+      });
+    }
+
+    return Array.from(relationMap.values());
+  }
+
+  const addSpouseRelation = () => {
+    setSpouseRelations(prev => [
+      ...prev,
+      { personId: '', status: 'current', startDate: null, endDate: null, childrenIds: [] },
+    ]);
+  };
+
+  const updateSpouseRelation = (index: number, updates: Partial<SpouseRelation>) => {
+    setSpouseRelations(prev => prev.map((relation, relationIndex) => (
+      relationIndex === index ? { ...relation, ...updates } : relation
+    )));
+  };
+
+  const removeSpouseRelation = (index: number) => {
+    setSpouseRelations(prev => prev.filter((_, relationIndex) => relationIndex !== index));
+  };
+
+  const getChildOptionsForRelation = (relation: SpouseRelation): Person[] => {
+    const selectedChildren = new Set(relation.childrenIds || []);
+    const spouse = allPeople.find(p => p.id === relation.personId);
+    const hasMaleParent = gender === 'male' || spouse?.gender === 'male';
+    const hasFemaleParent = gender === 'female' || spouse?.gender === 'female';
+
+    return allPeople.filter(candidate => {
+      if (candidate.id === person?.id || candidate.id === relation.personId) return false;
+      if (selectedChildren.has(candidate.id)) return true;
+      if (hasMaleParent && candidate.fatherid) return false;
+      if (hasFemaleParent && candidate.motherid) return false;
+      return true;
+    });
+  };
+
+  const handleSubmit = async (e: React.FormEvent): Promise<void> => {
     e.preventDefault();
     const newErrors: { [key: string]: string } = {};
 
@@ -159,20 +229,41 @@ export default function MemberEditModal({
       return;
     }
 
+    const personId = person ? person.id : 'person-' + Math.random().toString(36).substr(2, 9);
+    let finalPhotoUrl = photourl.trim() || null;
+
+    if (photoFile) {
+      setUploadingPhoto(true);
+      setPhotoUploadError('');
+      try {
+        finalPhotoUrl = await uploadPersonPhoto(photoFile, personId);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Photo upload failed.';
+        setPhotoUploadError(message);
+        setUploadingPhoto(false);
+        return;
+      }
+      setUploadingPhoto(false);
+    }
+
+    const cleanSpouseRelations = normalizeSpouseRelations(spouseRelations);
+    const primarySpouseId = cleanSpouseRelations.find(relation => relation.status === 'current')?.personId || cleanSpouseRelations[0]?.personId || null;
+
     // Map fields
     const updatedPerson: Person = {
-      id: person ? person.id : 'person-' + Math.random().toString(36).substr(2, 9),
+      id: personId,
       name: name.trim(),
       gender,
       dob: dob || null,
       dod: dod || null,
-      photourl: photourl.trim() || null,
+      photourl: finalPhotoUrl,
       notes: notes.trim() || null,
       birthPlace: birthPlace.trim() || null,
       occupation: occupation.trim() || null,
       fatherid: fatherid || null,
       motherid: motherid || null,
-      spouseid: spouseid || null,
+      spouseid: primarySpouseId,
+      spouses: cleanSpouseRelations,
     };
 
     onSave(updatedPerson);
@@ -188,12 +279,12 @@ export default function MemberEditModal({
     <>
       {/* Background Dim */}
       <div 
-        className="fixed inset-0 bg-stone-900/55 z-50 transition-opacity backdrop-blur-xs cursor-pointer"
+        className="fixed inset-0 bg-stone-900/55 z-[200] transition-opacity backdrop-blur-xs cursor-pointer"
         onClick={onClose}
       />
 
       {/* Dialog box */}
-      <div className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 bg-[#fdfdfb] rounded-2xl w-full max-w-lg p-6 shadow-2xl z-50 border border-[var(--color-brand-border)] flex flex-col max-h-[90vh] overflow-y-auto font-sans">
+      <div className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 bg-[#fdfdfb] rounded-2xl w-full max-w-lg p-6 shadow-2xl z-[201] border border-[var(--color-brand-border)] flex flex-col max-h-[90vh] overflow-y-auto font-sans">
         
         {/* Modal Title header */}
         <div className="flex items-center justify-between border-b border-[var(--color-brand-border)] pb-3 mb-4 shrink-0">
@@ -306,15 +397,38 @@ export default function MemberEditModal({
           <div className="space-y-4">
             <div>
               <label className="block text-stone-600 font-extrabold mb-1 flex items-center justify-between">
-                <span>Photo URL</span>
-                <span className="text-[9px] text-stone-400 font-normal">Public image link</span>
+                <span>Photo</span>
+                <span className="text-[9px] text-stone-400 font-normal">Upload image or paste link</span>
               </label>
+              <label className="w-full px-3 py-3 rounded-xl border border-dashed border-[var(--color-brand-border)] bg-[#fafaf7] text-stone-700 font-bold text-xs cursor-pointer flex items-center justify-center gap-2 hover:bg-white transition-colors">
+                <Upload className="w-4 h-4 text-[var(--color-brand)]" />
+                <span>{photoFile ? photoFile.name : 'Choose photo from device'}</span>
+                <input
+                  type="file"
+                  accept="image/*"
+                  onChange={e => {
+                    const file = e.target.files?.[0] || null;
+                    setPhotoFile(file);
+                    setPhotoUploadError('');
+                  }}
+                  className="hidden"
+                />
+              </label>
+              {photourl && (
+                <div className="mt-2 flex items-center gap-2 text-[10px] text-stone-500">
+                  <ImageIcon className="w-3.5 h-3.5 text-[var(--color-brand)]" />
+                  Current photo is saved.
+                </div>
+              )}
+              {photoUploadError && (
+                <p className="text-[10px] text-red-600 font-bold mt-1">{photoUploadError}</p>
+              )}
               <input 
                 type="url" 
                 value={photourl} 
                 onChange={e => setPhotourl(e.target.value)}
-                placeholder="https://images.unsplash.com/photo-..."
-                className="w-full px-3 py-2.5 rounded-xl border border-[var(--color-brand-border)] bg-white text-stone-900 font-mono text-[10px] focus:ring-1 focus:ring-[var(--color-brand)]"
+                placeholder="Or paste photo link"
+                className="w-full mt-2 px-3 py-2.5 rounded-xl border border-[var(--color-brand-border)] bg-white text-stone-900 font-mono text-[10px] focus:ring-1 focus:ring-[var(--color-brand)]"
               />
             </div>
 
@@ -367,22 +481,87 @@ export default function MemberEditModal({
               </div>
             </div>
 
-            {/* Spouse Link */}
+            {/* Spouse Links */}
             <div>
               <label className="block text-stone-600 font-extrabold mb-1.5 flex items-center justify-between">
-                <span>Spouse / Husband / Wife</span>
-                <span className="text-[9px] text-stone-400 font-normal">Shows spouse link in tree</span>
+                <span>Spouses / Husband / Wife</span>
+                <button
+                  type="button"
+                  onClick={addSpouseRelation}
+                  className="text-[10px] text-[var(--color-brand)] font-black hover:underline cursor-pointer"
+                >
+                  + Add spouse
+                </button>
               </label>
-              <select
-                value={spouseid}
-                onChange={e => setSpouseid(e.target.value)}
-                className="w-full px-3 py-2 rounded-xl border border-[var(--color-brand-border)] bg-white text-stone-900 font-semibold text-xs focus:ring-1 focus:ring-[var(--color-brand)] cursor-pointer"
-              >
-                <option value="">-- No Spouse --</option>
-                {spouses.map(s => (
-                  <option key={s.id} value={s.id}>{s.name} ({s.dob ? s.dob.split('-')[0] : 'N/A'})</option>
+              <div className="space-y-3">
+                {spouseRelations.length === 0 ? (
+                  <p className="text-[11px] text-stone-400 italic font-serif bg-white border border-dashed border-[var(--color-brand-border)] rounded-xl p-3">
+                    No spouse recorded. Use Add spouse to add current or past spouse relations.
+                  </p>
+                ) : spouseRelations.map((relation, index) => (
+                  <div key={`${relation.personId || 'new'}-${index}`} className="bg-white border border-[var(--color-brand-border)] rounded-xl p-3 space-y-2">
+                    <div className="grid grid-cols-1 sm:grid-cols-[1fr_110px] gap-2">
+                      <select
+                        value={relation.personId}
+                        onChange={e => updateSpouseRelation(index, { personId: e.target.value })}
+                        className="w-full px-3 py-2 rounded-xl border border-[var(--color-brand-border)] bg-white text-stone-900 font-semibold text-xs focus:ring-1 focus:ring-[var(--color-brand)] cursor-pointer"
+                      >
+                        <option value="">-- Select spouse --</option>
+                        {spouses.map(s => (
+                          <option key={s.id} value={s.id}>{s.name} ({s.dob ? s.dob.split('-')[0] : 'N/A'})</option>
+                        ))}
+                      </select>
+                      <select
+                        value={relation.status || 'current'}
+                        onChange={e => updateSpouseRelation(index, { status: e.target.value as SpouseStatus })}
+                        className="w-full px-2 py-2 rounded-xl border border-[var(--color-brand-border)] bg-white text-stone-900 font-semibold text-xs cursor-pointer"
+                      >
+                        <option value="current">Current</option>
+                        <option value="former">Former</option>
+                        <option value="widowed">Widowed</option>
+                      </select>
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      <input
+                        type="date"
+                        value={relation.startDate || ''}
+                        onChange={e => updateSpouseRelation(index, { startDate: e.target.value || null })}
+                        className="w-full px-3 py-2 rounded-xl border border-[var(--color-brand-border)] bg-white text-stone-900 font-semibold text-xs"
+                        aria-label="Spouse relationship start date"
+                      />
+                      <input
+                        type="date"
+                        value={relation.endDate || ''}
+                        onChange={e => updateSpouseRelation(index, { endDate: e.target.value || null })}
+                        className="w-full px-3 py-2 rounded-xl border border-[var(--color-brand-border)] bg-white text-stone-900 font-semibold text-xs"
+                        aria-label="Spouse relationship end date"
+                      />
+                    </div>
+                    <label className="block text-[10px] text-stone-500 font-bold">
+                      Children in this relationship
+                    </label>
+                    <select
+                      multiple
+                      value={relation.childrenIds || []}
+                      onChange={e => updateSpouseRelation(index, {
+                        childrenIds: Array.from(e.currentTarget.selectedOptions as HTMLCollectionOf<HTMLOptionElement>).map(option => option.value),
+                      })}
+                      className="w-full min-h-20 px-3 py-2 rounded-xl border border-[var(--color-brand-border)] bg-white text-stone-900 font-semibold text-xs cursor-pointer"
+                    >
+                      {getChildOptionsForRelation(relation).map(child => (
+                        <option key={child.id} value={child.id}>{child.name}</option>
+                      ))}
+                    </select>
+                    <button
+                      type="button"
+                      onClick={() => removeSpouseRelation(index)}
+                      className="text-[10px] text-red-600 font-black hover:underline cursor-pointer"
+                    >
+                      Remove spouse relation
+                    </button>
+                  </div>
                 ))}
-              </select>
+              </div>
             </div>
           </div>
 
@@ -409,10 +588,11 @@ export default function MemberEditModal({
               </button>
               <button
                 type="submit"
+                disabled={uploadingPhoto}
                 className="bg-[var(--color-brand)] hover:bg-[var(--color-brand-dark)] text-white font-bold py-2 px-5 rounded-full text-xs flex items-center gap-1.5 shadow-sm hover:shadow-md transition-all cursor-pointer"
               >
                 <Save className="w-3.5 h-3.5" />
-                Preserve Record
+                {uploadingPhoto ? 'Uploading Photo...' : 'Preserve Record'}
               </button>
             </div>
           </div>

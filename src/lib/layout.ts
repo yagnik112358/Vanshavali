@@ -4,354 +4,357 @@
  */
 
 import { Node, Edge } from '@xyflow/react';
-import { Person } from '../types';
-
-interface LayoutState {
-  x: number;
-}
+import { Person, SpouseRelation } from '../types';
 
 const NODE_WIDTH = 280;
-const NODE_GAP = 48;
-const GENERATION_GAP = 260;
-const START_X = 50;
+const NODE_HEIGHT = 150;
+const NODE_GAP = 88;
+const LEVEL_GAP = 300;
+const SUBTREE_GAP = 180;
+const START_X = 80;
 const START_Y = 60;
-const NODE_STEP = NODE_WIDTH + NODE_GAP;
-const COUPLE_STEP = (NODE_WIDTH * 2) + NODE_GAP + 120;
 
 /**
- * Custom-built family-tree layout positioning engine.
- * Walks the generations recursively from the absolute patriarchs/matriarchs down,
- * grouping spouses and positioning children horizontally underneath their parent pairs.
+ * Strict level-order family tree layout.
+ *
+ * Parents are always placed above children. Siblings are grouped under the same
+ * parent unit, and the tree grows horizontally instead of compressing lines
+ * through unrelated people.
  */
 export function buildFamilyTreeLayout(
   people: Person[],
   focusPersonId: string | null = null
 ): { nodes: Node[]; edges: Edge[] } {
-  // If no people, return empty
   if (people.length === 0) {
     return { nodes: [], edges: [] };
   }
 
-  // Pre-calculate easy lookup maps
   const personMap = new Map<string, Person>();
-  people.forEach(p => personMap.set(p.id, p));
+  people.forEach(person => personMap.set(person.id, person));
 
-  // Determine children lookup
-  const childrenMap = new Map<string, Person[]>(); // Key: 'fatherId_motherId' or single parent ids
-  people.forEach(p => {
-    // If father is present, associate
-    if (p.fatherid) {
-      const arr = childrenMap.get(p.fatherid) || [];
-      if (!arr.some(item => item.id === p.id)) arr.push(p);
-      childrenMap.set(p.fatherid, arr);
-    }
-    // If mother is present, associate
-    if (p.motherid) {
-      const arr = childrenMap.get(p.motherid) || [];
-      if (!arr.some(item => item.id === p.id)) arr.push(p);
-      childrenMap.set(p.motherid, arr);
-    }
-  });
-
-  // Calculate generational depth starting from patriarchs (level 0)
-  const generationsMap = new Map<string, number>(); // ID -> Gen level
-
-  // Helper: Find patriarchs (nodes without parents in our current list)
-  const patriarchs = people.filter(p => !p.fatherid && !p.motherid);
-  
-  // Set default generation levels starting from patriarchs (level 0)
-  function assignBaseGenerations(personId: string, currentLevel: number, visited: Set<string>) {
-    if (visited.has(personId)) return;
-    visited.add(personId);
-
-    const level = generationsMap.get(personId) ?? -1;
-    if (currentLevel > level) {
-      generationsMap.set(personId, currentLevel);
-      
-      const person = personMap.get(personId);
-      if (person) {
-        // Assign spouse to same generation level
-        if (person.spouseid) {
-          generationsMap.set(person.spouseid, currentLevel);
-        }
-        // Get children list
-        const kids = getChildrenOf(personId);
-        kids.forEach(kid => {
-          assignBaseGenerations(kid.id, currentLevel + 1, visited);
-        });
-      }
-    }
-  }
-
-  // Get active children helper
-  function getChildrenOf(personId: string): Person[] {
-    const parent = personMap.get(personId);
-    if (!parent) return [];
-    
-    // Children where either mother or father is this person
-    return people.filter(p => p.fatherid === personId || p.motherid === personId);
-  }
-
-  const baseVisited = new Set<string>();
-  patriarchs.forEach(pat => {
-    assignBaseGenerations(pat.id, 0, baseVisited);
-  });
-
-  // Deal with any orphaned loops/disconnections
-  people.forEach(p => {
-    if (!generationsMap.has(p.id)) {
-      generationsMap.set(p.id, 0);
-    }
-  });
-
-  // If we have a focus member, we ONLY show immediate relatives logic:
-  // - Focused person
-  // - Father & Mother
-  // - Spouse (or anyone who is spouse of this focused person)
-  // - Children (anyone who has this focused person as father or mother)
   let activePeople = [...people];
   if (focusPersonId && personMap.has(focusPersonId)) {
     const focusPerson = personMap.get(focusPersonId)!;
-    const keepIds = new Set<string>();
-    
-    // Add self
-    keepIds.add(focusPersonId);
-    
-    // Add parents
-    if (focusPerson.fatherid) keepIds.add(focusPerson.fatherid);
-    if (focusPerson.motherid) keepIds.add(focusPerson.motherid);
-    
-    // Add spouse
+    const keepIds = new Set<string>([focusPersonId]);
+
+    getParentIds(focusPerson, personMap).forEach(parentId => keepIds.add(parentId));
     if (focusPerson.spouseid) keepIds.add(focusPerson.spouseid);
-    people.forEach(p => {
-      if (p.spouseid === focusPersonId) {
-        keepIds.add(p.id);
-      }
+    getSpouseRelations(focusPerson).forEach(relation => keepIds.add(relation.personId));
+
+    people.forEach(person => {
+      if (person.spouseid === focusPersonId) keepIds.add(person.id);
+      if (getSpouseRelations(person).some(relation => relation.personId === focusPersonId)) keepIds.add(person.id);
+      if (getParentIds(person, personMap).includes(focusPersonId)) keepIds.add(person.id);
     });
 
-    // Add children
-    people.forEach(p => {
-      if (p.fatherid === focusPersonId || p.motherid === focusPersonId) {
-        keepIds.add(p.id);
-      }
-    });
-
-    activePeople = people.filter(p => keepIds.has(p.id));
+    activePeople = people.filter(person => keepIds.has(person.id));
   }
 
-  // Recalculate maps for active set only
   const activeMap = new Map<string, Person>();
-  activePeople.forEach(p => activeMap.set(p.id, p));
+  activePeople.forEach(person => activeMap.set(person.id, person));
 
-  // Build Layout Coordinates
-  // Spacing must match the rendered card width in FamilyMemberNode.
   const nodes: Node[] = [];
   const edges: Edge[] = [];
   const posMap = new Map<string, { x: number; y: number }>();
 
-  // A list of processed couples to prevent outputting them multiple times
-  const processedCouples = new Set<string>();
-  const processedIndividuals = new Set<string>();
+  function getParentIds(person: Person, lookup: Map<string, Person>): string[] {
+    return [person.fatherid, person.motherid].filter((id): id is string => !!id && lookup.has(id));
+  }
 
-  // In order to make a nice aligned layout, we sort active people by generation, then group by parent pairs.
-  const activeGens: { [level: number]: Person[] } = {};
-  activePeople.forEach(p => {
-    const g = generationsMap.get(p.id) || 0;
-    if (!activeGens[g]) activeGens[g] = [];
-    activeGens[g].push(p);
-  });
-
-  const levels = Object.keys(activeGens).map(Number).sort((a, b) => a - b);
-  
-  // Track continuous horizontal offset per level to keep it super simple and prevent overlap
-  const levelOffsets: { [gen: number]: number } = {};
-  levels.forEach(g => {
-    levelOffsets[g] = 0;
-  });
-
-  // 1. Arrange each generation. Let's process level by level.
-  levels.forEach(g => {
-    const levelPeople = activeGens[g];
-    let currentX = START_X; // Starting x padding
-
-    levelPeople.forEach(p => {
-      if (processedIndividuals.has(p.id)) return;
-
-      const y = g * GENERATION_GAP + START_Y; // Base Y position for this generation
-
-      // Check if this person has a spouse in the same generation
-      const spouse = p.spouseid ? activeMap.get(p.spouseid) : null;
-      const isSpouseAtSameLevel = spouse && (generationsMap.get(spouse.id) === g);
-
-      if (isSpouseAtSameLevel && spouse) {
-        // Found couple!
-        processedIndividuals.add(p.id);
-        processedIndividuals.add(spouse.id);
-
-        const coupleId = [p.id, spouse.id].sort().join('-');
-        if (processedCouples.has(coupleId)) return;
-        processedCouples.add(coupleId);
-
-        // Put primary member on left, spouse on right
-        const leftPerson = p.gender === 'male' ? p : spouse;
-        const rightPerson = p.gender === 'male' ? spouse : p;
-
-        // Position husband & wife next to each other
-        const xLeft = currentX;
-        const xRight = currentX + NODE_STEP;
-
-        posMap.set(leftPerson.id, { x: xLeft, y });
-        posMap.set(rightPerson.id, { x: xRight, y });
-
-        // Build spouse connector edge (dashed gold line, horizontal, union style)
-        edges.push({
-          id: `spouse-edge-${leftPerson.id}-${rightPerson.id}`,
-          source: leftPerson.id,
-          target: rightPerson.id,
-          type: 'straight',
-          animated: false,
-          style: { stroke: '#eab308', strokeWidth: 3, strokeDasharray: '4 4' },
-          markerEnd: undefined // Couples don't need arrows
-        });
-
-        // Advance horizontal spacing cursor
-        currentX += COUPLE_STEP; // Spacious padding for families
-      } else {
-        // Individual with no active spouse
-        processedIndividuals.add(p.id);
-        posMap.set(p.id, { x: currentX, y });
-        currentX += NODE_STEP;
-      }
-    });
-
-    levelOffsets[g] = currentX;
-  });
-
-  // 2. Beautiful alignment pass: Centering children below parents!
-  // If parents A and B are positioned at (X_A, Y_A) and (X_B, Y_B),
-  // they form a mid-point X_parentMatch = (X_A + X_B) / 2.
-  // Their children should ideally be centered around X_parentMatch!
-  // Let's do a top-down alignment tuning pass to make it look gorgeous.
-  levels.forEach(g => {
-    const parentLevelPeople = activeGens[g] || [];
-    
-    parentLevelPeople.forEach(parent => {
-      // Find spouse
-      const spouse = parent.spouseid ? activeMap.get(parent.spouseid) : null;
-      if (!spouse) return;
-
-      const parentPos = posMap.get(parent.id);
-      const spousePos = posMap.get(spouse.id);
-      if (!parentPos || !spousePos) return;
-
-      // Calculate couple mid point
-      const midX = (parentPos.x + spousePos.x) / 2;
-
-      // Get children
-      const kids = activePeople.filter(p => p.fatherid === parent.id || p.motherid === parent.id);
-      if (kids.length === 0) return;
-
-      // Center the kids below. Total width occupied by kids is based on actual node spacing.
-      const kidsWidth = (kids.length - 1) * NODE_STEP;
-      const startKidsX = midX - kidsWidth / 2;
-
-      kids.forEach((kid, idx) => {
-        const kidPos = posMap.get(kid.id);
-        const kidGen = generationsMap.get(kid.id) || (g + 1);
-        if (kidPos) {
-          // Adjust kid's x coordinates dynamically to center, avoiding extreme shifts that overlap other couples
-          const proposedX = startKidsX + (idx * NODE_STEP);
-          
-          // Only shift if it doesn't cause negative coordinates or major bounds overlap.
-          // In a simple app, setting it directly yields an incredible neat grid!
-          kidPos.x = proposedX;
-          posMap.set(kid.id, kidPos);
-        }
+  function getSpouseRelations(person: Person): SpouseRelation[] {
+    const relationMap = new Map<string, SpouseRelation>();
+    (person.spouses || []).forEach(relation => {
+      if (!relation.personId) return;
+      relationMap.set(relation.personId, {
+        personId: relation.personId,
+        status: relation.status || 'current',
+        startDate: relation.startDate || null,
+        endDate: relation.endDate || null,
+        childrenIds: relation.childrenIds || [],
       });
     });
+    if (person.spouseid && !relationMap.has(person.spouseid)) {
+      relationMap.set(person.spouseid, {
+        personId: person.spouseid,
+        status: 'current',
+        startDate: null,
+        endDate: null,
+        childrenIds: [],
+      });
+    }
+    return Array.from(relationMap.values());
+  }
+
+  const spouseGraph = new Map<string, Set<string>>();
+  activePeople.forEach(person => spouseGraph.set(person.id, new Set<string>()));
+  activePeople.forEach(person => {
+    getSpouseRelations(person).forEach(relation => {
+      if (!activeMap.has(relation.personId)) return;
+      spouseGraph.get(person.id)?.add(relation.personId);
+      spouseGraph.get(relation.personId)?.add(person.id);
+    });
   });
 
-  // 3. Prevent extreme horizontal overlap post-center
-  // If any two nodes in the exact same generation level are too close, shove them apart.
-  levels.forEach(g => {
-    const levelPeople = activeGens[g] || [];
-    // Sort them by current calculated X position
-    levelPeople.sort((a, b) => {
-      const xA = posMap.get(a.id)?.x ?? 0;
-      const xB = posMap.get(b.id)?.x ?? 0;
-      return xA - xB;
+  const spouseUnitByPerson = new Map<string, string>();
+  const visitedSpouseUnits = new Set<string>();
+  activePeople.forEach(person => {
+    if (visitedSpouseUnits.has(person.id)) return;
+
+    const stack = [person.id];
+    const component: string[] = [];
+    visitedSpouseUnits.add(person.id);
+
+    while (stack.length > 0) {
+      const personId = stack.pop()!;
+      component.push(personId);
+      spouseGraph.get(personId)?.forEach(spouseId => {
+        if (visitedSpouseUnits.has(spouseId)) return;
+        visitedSpouseUnits.add(spouseId);
+        stack.push(spouseId);
+      });
+    }
+
+    const unitKey = component.sort().join('__');
+    component.forEach(personId => spouseUnitByPerson.set(personId, unitKey));
+  });
+
+  function getUnitKey(personId: string): string {
+    return spouseUnitByPerson.get(personId) || personId;
+  }
+
+  function getPeopleOrderIndex(personId: string): number {
+    return activePeople.findIndex(person => person.id === personId);
+  }
+
+  const unitMembers = new Map<string, Person[]>();
+  activePeople.forEach(person => {
+    const key = getUnitKey(person.id);
+    const members = unitMembers.get(key) || [];
+    if (!members.some(member => member.id === person.id)) {
+      members.push(person);
+    }
+    unitMembers.set(key, members);
+  });
+
+  unitMembers.forEach((members, key) => {
+    members.sort((a, b) => {
+      if (a.gender === 'male' && b.gender !== 'male') return -1;
+      if (a.gender !== 'male' && b.gender === 'male') return 1;
+      return getPeopleOrderIndex(a.id) - getPeopleOrderIndex(b.id);
     });
+    unitMembers.set(key, members);
+  });
 
-    // Check overlaps
-    for (let i = 1; i < levelPeople.length; i++) {
-      const prevId = levelPeople[i - 1].id;
-      const currId = levelPeople[i].id;
-      const prevPos = posMap.get(prevId);
-      const currPos = posMap.get(currId);
+  function getUnitSortIndex(unitKey: string): number {
+    const indexes = (unitMembers.get(unitKey) || [])
+      .map(member => getPeopleOrderIndex(member.id))
+      .filter(index => index >= 0);
+    return indexes.length > 0 ? Math.min(...indexes) : Number.MAX_SAFE_INTEGER;
+  }
 
-      if (prevPos && currPos) {
-        const minGap = NODE_STEP; // minimum margin based on rendered node width
-        if (currPos.x < prevPos.x + minGap) {
-          const overlap = (prevPos.x + minGap) - currPos.x;
-          // Shift this and all subsequent nodes in the same level right
-          for (let j = i; j < levelPeople.length; j++) {
-            const idToShift = levelPeople[j].id;
-            const pos = posMap.get(idToShift);
-            if (pos) {
-              pos.x += overlap;
-              posMap.set(idToShift, pos);
-            }
-          }
-        }
+  const parentUnitByUnit = new Map<string, string>();
+  unitMembers.forEach((members, unitKey) => {
+    for (const member of members) {
+      const parentId = getParentIds(member, activeMap).find(id => getUnitKey(id) !== unitKey);
+      if (parentId) {
+        parentUnitByUnit.set(unitKey, getUnitKey(parentId));
+        break;
       }
     }
   });
 
-  // 4. Transform Person models into visual Nodes
-  activePeople.forEach(p => {
-    const coords = posMap.get(p.id) || { x: 50, y: 50 };
-    
-    // Check if this person is focused
-    const isFocused = p.id === focusPersonId;
+  function getParentIdsForUnit(unitKey: string): string[] {
+    const parentIds = new Set<string>();
+    (unitMembers.get(unitKey) || []).forEach(member => {
+      getParentIds(member, activeMap).forEach(parentId => {
+        if (getUnitKey(parentId) !== unitKey) {
+          parentIds.add(parentId);
+        }
+      });
+    });
+    return Array.from(parentIds);
+  }
 
+  const childrenByUnit = new Map<string, string[]>();
+  parentUnitByUnit.forEach((parentUnitKey, childUnitKey) => {
+    const children = childrenByUnit.get(parentUnitKey) || [];
+    if (!children.includes(childUnitKey)) {
+      children.push(childUnitKey);
+    }
+    childrenByUnit.set(parentUnitKey, children);
+  });
+
+  childrenByUnit.forEach((children, parentKey) => {
+    children.sort((a, b) => getUnitSortIndex(a) - getUnitSortIndex(b));
+    childrenByUnit.set(parentKey, children);
+  });
+
+  function getUnitWidth(unitKey: string): number {
+    const memberCount = unitMembers.get(unitKey)?.length || 1;
+    return (memberCount * NODE_WIDTH) + ((memberCount - 1) * NODE_GAP);
+  }
+
+  const measuredWidths = new Map<string, number>();
+  function measureSubtree(unitKey: string, visiting = new Set<string>()): number {
+    if (measuredWidths.has(unitKey)) return measuredWidths.get(unitKey)!;
+    if (visiting.has(unitKey)) return getUnitWidth(unitKey);
+
+    visiting.add(unitKey);
+    const childKeys = childrenByUnit.get(unitKey) || [];
+    const childrenWidth = childKeys.reduce((total, childKey, index) => {
+      const gap = index === 0 ? 0 : SUBTREE_GAP;
+      return total + gap + measureSubtree(childKey, visiting);
+    }, 0);
+    visiting.delete(unitKey);
+
+    const width = Math.max(getUnitWidth(unitKey), childrenWidth);
+    measuredWidths.set(unitKey, width);
+    return width;
+  }
+
+  const positioned = new Set<string>();
+  function positionSubtree(unitKey: string, left: number, level: number): void {
+    if (positioned.has(unitKey)) return;
+    positioned.add(unitKey);
+
+    const subtreeWidth = measureSubtree(unitKey);
+    const members = unitMembers.get(unitKey) || [];
+    const unitWidth = getUnitWidth(unitKey);
+    const unitLeft = left + ((subtreeWidth - unitWidth) / 2);
+    const y = START_Y + (level * LEVEL_GAP);
+
+    members.forEach((member, index) => {
+      posMap.set(member.id, {
+        x: unitLeft + (index * (NODE_WIDTH + NODE_GAP)),
+        y,
+      });
+    });
+
+    const childKeys = [...(childrenByUnit.get(unitKey) || [])].sort((a, b) => {
+      const getDesiredCenter = (childKey: string): number => {
+        const parentCenters = getParentIdsForUnit(childKey)
+          .map(parentId => posMap.get(parentId))
+          .filter((pos): pos is { x: number; y: number } => !!pos)
+          .map(pos => pos.x + (NODE_WIDTH / 2));
+        if (parentCenters.length === 0) return getUnitSortIndex(childKey);
+        return parentCenters.reduce((sum, center) => sum + center, 0) / parentCenters.length;
+      };
+
+      return getDesiredCenter(a) - getDesiredCenter(b);
+    });
+    const childrenWidth = childKeys.reduce((total, childKey, index) => {
+      const gap = index === 0 ? 0 : SUBTREE_GAP;
+      return total + gap + measureSubtree(childKey);
+    }, 0);
+
+    let childLeft = left + ((subtreeWidth - childrenWidth) / 2);
+    childKeys.forEach((childKey, index) => {
+      if (index > 0) childLeft += SUBTREE_GAP;
+      positionSubtree(childKey, childLeft, level + 1);
+      childLeft += measureSubtree(childKey);
+    });
+  }
+
+  const rootUnitKeys = Array.from(unitMembers.keys())
+    .filter(unitKey => !parentUnitByUnit.has(unitKey) || parentUnitByUnit.get(unitKey) === unitKey)
+    .sort((a, b) => getUnitSortIndex(a) - getUnitSortIndex(b));
+
+  let nextRootX = START_X;
+  rootUnitKeys.forEach(rootKey => {
+    positionSubtree(rootKey, nextRootX, 0);
+    nextRootX += measureSubtree(rootKey) + SUBTREE_GAP;
+  });
+
+  Array.from(unitMembers.keys()).forEach(unitKey => {
+    if (positioned.has(unitKey)) return;
+    positionSubtree(unitKey, nextRootX, 0);
+    nextRootX += measureSubtree(unitKey) + SUBTREE_GAP;
+  });
+
+  activePeople.forEach(person => {
+    const coords = posMap.get(person.id) || { x: START_X, y: START_Y };
     nodes.push({
-      id: p.id,
-      type: 'familyMember', // Custom React Flow Node style
-      position: { x: coords.x, y: coords.y },
+      id: person.id,
+      type: 'familyMember',
+      position: coords,
       data: {
-        person: p,
-        isFocused,
-        onFocusSelect: undefined, // Filled at runtime in React component
+        person,
+        isFocused: person.id === focusPersonId,
+        onFocusSelect: undefined,
       },
       draggable: true,
+      zIndex: 10,
     });
+  });
 
-    // Add Parent-to-Child edges
-    // We draw connection from BOTH father and mother to the child.
-    // However, to make it super elegant, we can combine father-mother links or connect them nicely.
-    // Connect father -> child
-    if (p.fatherid && activeMap.has(p.fatherid)) {
-      edges.push({
-        id: `parent-father-edge-${p.fatherid}-${p.id}`,
-        source: p.fatherid,
-        target: p.id,
-        type: 'smoothstep',
-        animated: false,
-        style: { stroke: '#475569', strokeWidth: 2 }, // Slate colored line for fathers
-      });
-    }
+  const drawnSpouseEdges = new Set<string>();
+  activePeople.forEach(person => {
+    getSpouseRelations(person).forEach(relation => {
+      if (!activeMap.has(relation.personId)) return;
+      const edgeKey = [person.id, relation.personId].sort().join('__');
+      if (drawnSpouseEdges.has(edgeKey)) return;
+      drawnSpouseEdges.add(edgeKey);
 
-    // Connect mother -> child
-    if (p.motherid && activeMap.has(p.motherid)) {
+      const sourcePos = posMap.get(person.id);
+      const targetPos = posMap.get(relation.personId);
+      const sourceIsLeft = (sourcePos?.x || 0) <= (targetPos?.x || 0);
+
+      const sourceY = sourcePos?.y ?? targetPos?.y ?? START_Y;
       edges.push({
-        id: `parent-mother-edge-${p.motherid}-${p.id}`,
-        source: p.motherid,
-        target: p.id,
-        type: 'smoothstep',
+        id: `spouse-edge-${edgeKey}`,
+        source: sourceIsLeft ? person.id : relation.personId,
+        target: sourceIsLeft ? relation.personId : person.id,
+        sourceHandle: 'right',
+        targetHandle: 'left',
+        type: 'familyRelation',
+        data: { laneY: sourceY - 34 },
         animated: false,
-        style: { stroke: '#be185d', strokeWidth: 2 }, // Crimson/rose styled line for mothers
+        style: {
+          stroke: relation.status === 'current' ? '#eab308' : '#a8a29e',
+          strokeWidth: relation.status === 'current' ? 3 : 2,
+          strokeDasharray: relation.status === 'current' ? '4 4' : '2 6',
+        },
+        zIndex: 0,
       });
-    }
+    });
+  });
+
+  const childLaneIndex = new Map<string, number>();
+  activePeople
+    .filter(child => getParentIds(child, activeMap).length > 0)
+    .sort((a, b) => (posMap.get(a.id)?.x || 0) - (posMap.get(b.id)?.x || 0))
+    .forEach((child, index) => childLaneIndex.set(child.id, index));
+
+  const drawnParentEdges = new Set<string>();
+  activePeople.forEach(child => {
+    getParentIds(child, activeMap).forEach(parentId => {
+      const edgeId = `parent-edge-${parentId}-${child.id}`;
+      if (drawnParentEdges.has(edgeId)) return;
+      drawnParentEdges.add(edgeId);
+
+      const parentPos = posMap.get(parentId);
+      const childPos = posMap.get(child.id);
+      const laneOffset = ((childLaneIndex.get(child.id) || 0) % 4) * 24;
+      const laneY = parentPos && childPos
+        ? Math.min(parentPos.y + NODE_HEIGHT + 48 + laneOffset, childPos.y - 56)
+        : undefined;
+
+      edges.push({
+        id: edgeId,
+        source: parentId,
+        sourceHandle: 'bottom',
+        target: child.id,
+        targetHandle: 'top',
+        type: 'familyRelation',
+        data: { laneY },
+        animated: false,
+        style: {
+          stroke: child.fatherid === parentId ? '#475569' : '#be185d',
+          strokeWidth: 2.25,
+        },
+        zIndex: 0,
+      });
+    });
   });
 
   return { nodes, edges };

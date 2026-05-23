@@ -19,9 +19,10 @@ import {
 import '@xyflow/react/dist/style.css';
 
 import { Person, Gender } from './types';
-import { getPeople, savePerson, deletePerson, isSupabaseConnected } from './lib/db';
+import { getPeople, savePerson, deletePerson, isSupabaseConnected, uploadPersonPhoto } from './lib/db';
 import { buildFamilyTreeLayout } from './lib/layout';
 import { FamilyMemberNode } from './components/FamilyMemberNode';
+import { FamilyRelationEdge } from './components/FamilyRelationEdge';
 import MemberProfileSheet from './components/MemberProfileSheet';
 import MemberEditModal from './components/MemberEditModal';
 import SupabaseGuidePanel from './components/SupabaseGuidePanel';
@@ -52,6 +53,10 @@ const nodeTypes = {
   familyMember: FamilyMemberNode,
 };
 
+const edgeTypes = {
+  familyRelation: FamilyRelationEdge,
+};
+
 // Internal Workspace Dashboard (requires ReactFlowProvider)
 function FamilyTreeWorkspace() {
   const { fitView, zoomIn, zoomOut } = useReactFlow();
@@ -64,6 +69,7 @@ function FamilyTreeWorkspace() {
   
   // Filtering & Focus parameters
   const [focusPersonId, setFocusPersonId] = useState<string | null>(null);
+  const [pendingTreeFit, setPendingTreeFit] = useState(false);
 
   // Side drawers and editing sheet controllers
   const [selectedPersonForProfile, setSelectedPersonForProfile] = useState<Person | null>(null);
@@ -207,6 +213,21 @@ function FamilyTreeWorkspace() {
     }
   };
 
+  const handleProfilePhotoUpload = async (person: Person, file: File): Promise<void> => {
+    if (!isUnlocked) {
+      setIsLockModalOpen(true);
+      throw new Error('Unlock Editor Mode before changing photos.');
+    }
+
+    const photoUrl = await uploadPersonPhoto(file, person.id);
+    const updatedPerson = { ...person, photourl: photoUrl };
+    const savedPerson = await savePerson(updatedPerson);
+    const data = await getPeople();
+
+    setPeople(data);
+    setSelectedPersonForProfile(savedPerson);
+  };
+
   // Profile triggers
   const triggerViewProfile = (person: Person) => {
     setIsEditOpen(false);
@@ -270,10 +291,7 @@ function FamilyTreeWorkspace() {
   // Focus and Zoom centers
   const handleFocusSelect = (id: string | null) => {
     setFocusPersonId(id);
-    // Let's animate centering
-    setTimeout(() => {
-      fitView({ duration: 800, padding: 0.25 });
-    }, 100);
+    setPendingTreeFit(true);
   };
 
   // Search Live Filters: both for list search and highlighting in tree
@@ -305,6 +323,19 @@ function FamilyTreeWorkspace() {
 
     return { nodes: finalNodes, edges: layout.edges };
   }, [people, focusPersonId]);
+
+  useEffect(() => {
+    if (!pendingTreeFit || viewMode !== 'tree' || loading) return;
+
+    const frame = window.requestAnimationFrame(() => {
+      window.setTimeout(() => {
+        fitView({ duration: 800, padding: 0.25 });
+        setPendingTreeFit(false);
+      }, 50);
+    });
+
+    return () => window.cancelAnimationFrame(frame);
+  }, [pendingTreeFit, viewMode, loading, focusPersonId, nodes.length, edges.length, fitView]);
 
   // General statistics computation
   const stats = useMemo(() => {
@@ -661,6 +692,7 @@ function FamilyTreeWorkspace() {
               nodes={nodes}
               edges={edges}
               nodeTypes={nodeTypes}
+              edgeTypes={edgeTypes}
               connectionLineType={ConnectionLineType.SmoothStep}
               fitView
               minZoom={0.1}
@@ -834,6 +866,9 @@ function FamilyTreeWorkspace() {
             setIsProfileOpen(false);
             triggerEditMember(p);
           }}
+          onUploadPhoto={handleProfilePhotoUpload}
+          canEdit={isUnlocked}
+          onRequireUnlock={() => setIsLockModalOpen(true)}
         />
 
         {/* 5. Members database insertion / update modal dialog */}

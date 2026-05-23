@@ -4,11 +4,20 @@
  */
 
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
-import { Person, Gender } from '../types';
+import { Person, Gender, SpouseRelation } from '../types';
 
 // Let's load Supabase keys from environment variables safely
 const supabaseUrl = (import.meta as any).env.VITE_SUPABASE_URL || '';
 const supabaseAnonKey = (import.meta as any).env.VITE_SUPABASE_ANON_KEY || '';
+const photoBucketName = (import.meta as any).env.VITE_SUPABASE_PHOTO_BUCKET || 'family-photos';
+const MAX_ORIGINAL_PHOTO_BYTES = 8 * 1024 * 1024;
+const MAX_UPLOADED_PHOTO_BYTES = 180 * 1024;
+const PHOTO_COMPRESSION_ATTEMPTS = [
+  { maxDimension: 900, quality: 0.72 },
+  { maxDimension: 720, quality: 0.62 },
+  { maxDimension: 560, quality: 0.52 },
+  { maxDimension: 420, quality: 0.42 },
+] as const;
 
 let supabase: SupabaseClient | null = null;
 
@@ -68,6 +77,128 @@ export function getSupabaseDetails() {
     hasAnonKey: !!supabaseAnonKey,
     isConnected: isSupabaseConnected(),
   };
+}
+
+async function loadImageFromFile(file: File): Promise<HTMLImageElement> {
+  const objectUrl = URL.createObjectURL(file);
+  const image = new Image();
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      image.onload = () => resolve();
+      image.onerror = () => reject(new Error('Could not read selected photo.'));
+      image.src = objectUrl;
+    });
+    return image;
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
+async function compressImageToBlob(
+  image: HTMLImageElement,
+  maxDimension: number,
+  quality: number,
+): Promise<Blob> {
+  const scale = Math.min(1, maxDimension / Math.max(image.width, image.height));
+  const width = Math.max(1, Math.round(image.width * scale));
+  const height = Math.max(1, Math.round(image.height * scale));
+
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+
+  const context = canvas.getContext('2d');
+  if (!context) {
+    throw new Error('Photo compression is not supported in this browser.');
+  }
+
+  context.drawImage(image, 0, 0, width, height);
+
+  return new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob(
+      compressedBlob => {
+        if (!compressedBlob) {
+          reject(new Error('Photo compression failed.'));
+          return;
+        }
+        resolve(compressedBlob);
+      },
+      'image/jpeg',
+      quality,
+    );
+  });
+}
+
+async function compressPhoto(file: File): Promise<File> {
+  if (file.size <= MAX_UPLOADED_PHOTO_BYTES) {
+    return file;
+  }
+
+  const image = await loadImageFromFile(file);
+  let smallestBlob: Blob | null = null;
+
+  for (const attempt of PHOTO_COMPRESSION_ATTEMPTS) {
+    const blob = await compressImageToBlob(image, attempt.maxDimension, attempt.quality);
+    if (!smallestBlob || blob.size < smallestBlob.size) {
+      smallestBlob = blob;
+    }
+
+    if (blob.size <= MAX_UPLOADED_PHOTO_BYTES) {
+      const originalName = file.name.replace(/\.[^/.]+$/, '');
+      return new File([blob], `${originalName || 'photo'}.jpg`, { type: 'image/jpeg' });
+    }
+  }
+
+  if (smallestBlob) {
+    const sizeKb = Math.ceil(smallestBlob.size / 1024);
+    throw new Error(`Image limit exceeded. Photo is ${sizeKb} KB after compression. Please choose a smaller photo so it can fit under 200 KB.`);
+  }
+
+  throw new Error('Photo compression failed. Please choose a smaller photo.');
+}
+
+export async function uploadPersonPhoto(file: File, personId: string): Promise<string> {
+  if (!supabase) {
+    throw new Error('Supabase is not connected. Add Supabase keys before uploading photos.');
+  }
+
+  if (!file.type.startsWith('image/')) {
+    throw new Error('Please select an image file.');
+  }
+
+  if (file.size > MAX_ORIGINAL_PHOTO_BYTES) {
+    throw new Error('Photo is too large. Please choose an image under 8 MB.');
+  }
+
+  const uploadFile = await compressPhoto(file);
+  const extension = uploadFile.name.split('.').pop()?.toLowerCase() || 'jpg';
+  const cleanPersonId = personId.replace(/[^a-zA-Z0-9-_]/g, '-');
+  const filePath = `${cleanPersonId}/${Date.now()}.${extension}`;
+
+  const { error } = await supabase.storage
+    .from(photoBucketName)
+    .upload(filePath, uploadFile, {
+      cacheControl: '3600',
+      contentType: uploadFile.type,
+      upsert: true,
+    });
+
+  if (error) {
+    if (error.message.toLowerCase().includes('row-level security')) {
+      throw new Error('Photo upload blocked by Supabase Storage policy. Run the Storage policy SQL from the Supabase setup panel.');
+    }
+    if (
+      error.message.toLowerCase().includes('object') &&
+      (error.message.toLowerCase().includes('large') || error.message.toLowerCase().includes('bigger'))
+    ) {
+      throw new Error('Image limit exceeded. Please upload a smaller photo that can be compressed under 200 KB.');
+    }
+    throw new Error(`Photo upload failed: ${error.message}`);
+  }
+
+  const { data } = supabase.storage.from(photoBucketName).getPublicUrl(filePath);
+  return data.publicUrl;
 }
 
 // -------------------------------------------------------------
@@ -269,7 +400,61 @@ const SEED_PEOPLE: Person[] = [
 // Helper to sanitize field names when mapping from Supabase database rows.
 // This is critical since users might create fields in flat camelCase, flat lowercase,
 // or snake_case (e.g., father_id or souseid or spouseid or spouse_id).
+function parseSpouseRelations(value: unknown): SpouseRelation[] {
+  if (!value) return [];
+  if (Array.isArray(value)) return normalizeSpouseRelations(value as SpouseRelation[]);
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? normalizeSpouseRelations(parsed as SpouseRelation[]) : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+function normalizeSpouseRelations(relations: SpouseRelation[] | undefined, fallbackSpouseId?: string | null): SpouseRelation[] {
+  const relationMap = new Map<string, SpouseRelation>();
+
+  (relations || []).forEach(relation => {
+    if (!relation?.personId) return;
+    relationMap.set(relation.personId, {
+      personId: relation.personId,
+      status: relation.status || 'current',
+      startDate: relation.startDate || null,
+      endDate: relation.endDate || null,
+      childrenIds: Array.from(new Set(relation.childrenIds || [])),
+    });
+  });
+
+  if (fallbackSpouseId && !relationMap.has(fallbackSpouseId)) {
+    relationMap.set(fallbackSpouseId, {
+      personId: fallbackSpouseId,
+      status: 'current',
+      startDate: null,
+      endDate: null,
+      childrenIds: [],
+    });
+  }
+
+  return Array.from(relationMap.values());
+}
+
+function getPrimarySpouseId(spouses: SpouseRelation[]): string | null {
+  return spouses.find(relation => relation.status === 'current')?.personId || spouses[0]?.personId || null;
+}
+
 function mapPersonFromDb(row: any): Person {
+  const spouseid = row.spouseid !== undefined ? row.spouseid : 
+              (row.spouse_id !== undefined ? row.spouse_id : 
+               (row.souseid !== undefined ? row.souseid : 
+                (row.souse_id !== undefined ? row.souse_id : null)));
+  const spouses = normalizeSpouseRelations(
+    parseSpouseRelations(row.spouses !== undefined ? row.spouses : row.spouse_relations),
+    spouseid,
+  );
+
   return {
     id: String(row.id),
     name: row.name || '',
@@ -277,17 +462,24 @@ function mapPersonFromDb(row: any): Person {
     // Coalesce all potential database column styles:
     fatherid: row.fatherid !== undefined ? row.fatherid : (row.father_id !== undefined ? row.father_id : null),
     motherid: row.motherid !== undefined ? row.motherid : (row.mother_id !== undefined ? row.mother_id : null),
-    spouseid: row.spouseid !== undefined ? row.spouseid : 
-              (row.spouse_id !== undefined ? row.spouse_id : 
-               (row.souseid !== undefined ? row.souseid : 
-                (row.souse_id !== undefined ? row.souse_id : null))),
+    spouseid: getPrimarySpouseId(spouses),
     dob: row.dob || row.date_of_birth || null,
     dod: row.dod !== undefined ? row.dod : (row.date_of_death !== undefined ? row.date_of_death : null),
     photourl: row.photourl !== undefined ? row.photourl : 
               (row.photo_url !== undefined ? row.photo_url : null),
     notes: row.notes || '',
     birthPlace: row.birthplace || row.birth_place || '',
-    occupation: row.occupation || ''
+    occupation: row.occupation || '',
+    spouses,
+  };
+}
+
+function normalizePersonRecord(person: Person): Person {
+  const spouses = normalizeSpouseRelations(person.spouses, person.spouseid);
+  return {
+    ...person,
+    spouseid: getPrimarySpouseId(spouses),
+    spouses,
   };
 }
 
@@ -320,7 +512,7 @@ function initLocalStorage() {
   }
 
   if (shouldReset) {
-    localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(SEED_PEOPLE));
+    localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(SEED_PEOPLE.map(normalizePersonRecord)));
   }
 }
 
@@ -348,7 +540,7 @@ export async function getPeople(): Promise<Person[]> {
         // Table exists but is completely empty. Let's auto-seed this Supabase table!
         console.log('Supabase table is empty. Auto-seeding default family members...');
         await seedSupabaseTable(SEED_PEOPLE);
-        return SEED_PEOPLE;
+        return SEED_PEOPLE.map(normalizePersonRecord);
       }
     } catch (e) {
       console.error('Supabase getPeople error. Falling back to LocalStorage.', e);
@@ -358,15 +550,17 @@ export async function getPeople(): Promise<Person[]> {
   // Fallback to LocalStorage
   initLocalStorage();
   const raw = localStorage.getItem(LOCAL_STORAGE_KEY);
-  return raw ? JSON.parse(raw) : SEED_PEOPLE;
+  return raw ? (JSON.parse(raw) as Person[]).map(normalizePersonRecord) : SEED_PEOPLE.map(normalizePersonRecord);
 }
 
 // Add or edit a person
 export async function savePerson(person: Person): Promise<Person> {
-  const cleanPerson = { ...person };
+  const cleanPerson = normalizePersonRecord({ ...person });
   if (!cleanPerson.id) {
     cleanPerson.id = 'person-' + Math.random().toString(36).substr(2, 9);
   }
+  cleanPerson.spouses = normalizeSpouseRelations(cleanPerson.spouses, cleanPerson.spouseid);
+  cleanPerson.spouseid = getPrimarySpouseId(cleanPerson.spouses);
 
   if (supabase) {
     try {
@@ -386,17 +580,21 @@ export async function savePerson(person: Person): Promise<Person> {
       // Primary Attempt: Flat column naming (to match the prompt's exact literal fields: fatherid, motherid, spouseid, photourl)
       const flatPayload = {
         ...payload,
+        dod: cleanPerson.dod,
         fatherid: cleanPerson.fatherid,
         motherid: cleanPerson.motherid,
         spouseid: cleanPerson.spouseid,
+        spouses: cleanPerson.spouses,
         photourl: cleanPerson.photourl
       };
 
       const snakePayload = {
         ...payload,
+        date_of_death: cleanPerson.dod,
         father_id: cleanPerson.fatherid,
         mother_id: cleanPerson.motherid,
         spouse_id: cleanPerson.spouseid,
+        spouse_relations: cleanPerson.spouses,
         photo_url: cleanPerson.photourl
       };
 
@@ -427,9 +625,11 @@ export async function savePerson(person: Person): Promise<Person> {
       console.warn('Second save attempt failed. Trying of souseid typo mapping:', snakeError.message);
       const typoPayload = {
         ...payload,
+        dod: cleanPerson.dod,
         fatherid: cleanPerson.fatherid,
         motherid: cleanPerson.motherid,
         souseid: cleanPerson.spouseid,
+        spouses: cleanPerson.spouses,
         photourl: cleanPerson.photourl
       };
 
@@ -438,6 +638,28 @@ export async function savePerson(person: Person): Promise<Person> {
         .upsert(typoPayload);
 
       if (!typoError) {
+        await handleReciprocalRelationships(cleanPerson);
+        return cleanPerson;
+      }
+
+      const { spouses, ...legacyFlatPayload } = flatPayload;
+      const { spouse_relations, ...legacySnakePayload } = snakePayload;
+      const { spouses: typoSpouses, ...legacyTypoPayload } = typoPayload;
+
+      const { error: legacyFlatError } = await supabase.from('person').upsert(legacyFlatPayload);
+      if (!legacyFlatError) {
+        await handleReciprocalRelationships(cleanPerson);
+        return cleanPerson;
+      }
+
+      const { error: legacySnakeError } = await supabase.from('person').upsert(legacySnakePayload);
+      if (!legacySnakeError) {
+        await handleReciprocalRelationships(cleanPerson);
+        return cleanPerson;
+      }
+
+      const { error: legacyTypoError } = await supabase.from('person').upsert(legacyTypoPayload);
+      if (!legacyTypoError) {
         await handleReciprocalRelationships(cleanPerson);
         return cleanPerson;
       }
@@ -500,26 +722,52 @@ export async function deletePerson(id: string): Promise<boolean> {
   return false;
 }
 
-// Handle automatic linking: If Person A is set as Spouse of Person B,
-// then Person B's spouseid MUST automatically be set to Person A.
-// Similarly for clearing.
+// Handle automatic multi-spouse linking. If Person A includes Person B in spouses,
+// Person B receives/updates the reciprocal spouse relation without deleting older spouses.
 async function handleReciprocalRelationships(person: Person) {
   const allPeople = await getRawPeopleListOnly();
-  
-  // 1. Handle Spouse reciprocal linkage:
-  if (person.spouseid) {
-    const originalSpouse = allPeople.find(p => p.id === person.spouseid);
-    if (originalSpouse && originalSpouse.spouseid !== person.id) {
-      originalSpouse.spouseid = person.id;
-      await writeRawPersonQuietly(originalSpouse);
-    }
-  }
+  const currentPerson = allPeople.find(p => p.id === person.id) || person;
+  currentPerson.spouses = normalizeSpouseRelations(person.spouses, person.spouseid);
+  currentPerson.spouseid = getPrimarySpouseId(currentPerson.spouses);
 
-  // 2. Clear old spouse link if this person used to have a different spouse
-  const formerSpouses = allPeople.filter(p => p.spouseid === person.id && p.id !== person.spouseid);
-  for (const fs of formerSpouses) {
-    fs.spouseid = null;
-    await writeRawPersonQuietly(fs);
+  // Keep local fallback in sync with the latest saved person before adjusting relatives.
+  await writeRawPersonQuietly(currentPerson);
+
+  for (const relation of currentPerson.spouses || []) {
+    const spouse = allPeople.find(p => p.id === relation.personId);
+    if (!spouse) continue;
+
+    const spouseRelations = normalizeSpouseRelations(spouse.spouses, spouse.spouseid);
+    const existingIndex = spouseRelations.findIndex(item => item.personId === person.id);
+    const reciprocalRelation: SpouseRelation = {
+      personId: person.id,
+      status: relation.status || 'current',
+      startDate: relation.startDate || null,
+      endDate: relation.endDate || null,
+      childrenIds: Array.from(new Set(relation.childrenIds || [])),
+    };
+
+    if (existingIndex >= 0) {
+      spouseRelations[existingIndex] = reciprocalRelation;
+    } else {
+      spouseRelations.push(reciprocalRelation);
+    }
+
+    spouse.spouses = spouseRelations;
+    spouse.spouseid = getPrimarySpouseId(spouseRelations);
+    await writeRawPersonQuietly(spouse);
+
+    for (const childId of relation.childrenIds || []) {
+      const child = allPeople.find(p => p.id === childId);
+      if (!child) continue;
+
+      if (currentPerson.gender === 'male') child.fatherid = currentPerson.id;
+      if (currentPerson.gender === 'female') child.motherid = currentPerson.id;
+      if (spouse.gender === 'male') child.fatherid = spouse.id;
+      if (spouse.gender === 'female') child.motherid = spouse.id;
+
+      await writeRawPersonQuietly(child);
+    }
   }
 }
 
@@ -531,45 +779,90 @@ async function cleanReciprocalReferences(deletedId: string) {
   for (const p of allPeople) {
     if (p.spouseid === deletedId) {
       p.spouseid = null;
-      await writeRawPersonQuietly(p);
+      changed = true;
+    }
+    const spouses = normalizeSpouseRelations(p.spouses, p.spouseid).filter(relation => relation.personId !== deletedId);
+    if ((p.spouses || []).length !== spouses.length) {
+      p.spouses = spouses;
+      p.spouseid = getPrimarySpouseId(spouses);
       changed = true;
     }
     if (p.fatherid === deletedId) {
       p.fatherid = null;
-      await writeRawPersonQuietly(p);
       changed = true;
     }
     if (p.motherid === deletedId) {
       p.motherid = null;
-      await writeRawPersonQuietly(p);
       changed = true;
+    }
+    if (changed) {
+      await writeRawPersonQuietly(p);
+      changed = false;
     }
   }
 }
 
 // Low-level helper for silent local/remote saves
 async function writeRawPersonQuietly(person: Person) {
+  const normalizedPerson = normalizePersonRecord(person);
   if (supabase) {
     try {
-      const payload: any = {
-        id: person.id,
-        name: person.name,
-        gender: person.gender,
-        dob: person.dob,
-        notes: person.notes,
-        birthplace: person.birthPlace || '',
-        occupation: person.occupation || '',
-        fatherid: person.fatherid,
-        father_id: person.fatherid,
-        motherid: person.motherid,
-        mother_id: person.motherid,
-        spouseid: person.spouseid,
-        spouse_id: person.spouseid,
-        souseid: person.spouseid, // handle typo mapping
-        photourl: person.photourl,
-        photo_url: person.photourl,
+      const basePayload = {
+        id: normalizedPerson.id,
+        name: normalizedPerson.name,
+        gender: normalizedPerson.gender,
+        dob: normalizedPerson.dob,
+        dod: normalizedPerson.dod,
+        notes: normalizedPerson.notes,
+        birthplace: normalizedPerson.birthPlace || '',
+        occupation: normalizedPerson.occupation || '',
       };
-      await supabase.from('person').upsert(payload);
+
+      const flatPayload = {
+        ...basePayload,
+        fatherid: normalizedPerson.fatherid,
+        motherid: normalizedPerson.motherid,
+        spouseid: normalizedPerson.spouseid,
+        spouses: normalizedPerson.spouses,
+        photourl: normalizedPerson.photourl,
+      };
+
+      const snakePayload = {
+        ...basePayload,
+        date_of_death: normalizedPerson.dod,
+        father_id: normalizedPerson.fatherid,
+        mother_id: normalizedPerson.motherid,
+        spouse_id: normalizedPerson.spouseid,
+        spouse_relations: normalizedPerson.spouses,
+        photo_url: normalizedPerson.photourl,
+      };
+
+      const typoPayload = {
+        ...basePayload,
+        fatherid: normalizedPerson.fatherid,
+        motherid: normalizedPerson.motherid,
+        souseid: normalizedPerson.spouseid,
+        spouses: normalizedPerson.spouses,
+        photourl: normalizedPerson.photourl,
+      };
+
+      const { error: flatError } = await supabase.from('person').upsert(flatPayload);
+      if (!flatError) return;
+
+      const { error: snakeError } = await supabase.from('person').upsert(snakePayload);
+      if (!snakeError) return;
+
+      const { error: typoError } = await supabase.from('person').upsert(typoPayload);
+      if (!typoError) return;
+
+      const { spouses, ...legacyFlatPayload } = flatPayload;
+      const { spouse_relations, ...legacySnakePayload } = snakePayload;
+      const { spouses: typoSpouses, ...legacyTypoPayload } = typoPayload;
+      const { error: legacyFlatError } = await supabase.from('person').upsert(legacyFlatPayload);
+      if (!legacyFlatError) return;
+      const { error: legacySnakeError } = await supabase.from('person').upsert(legacySnakePayload);
+      if (!legacySnakeError) return;
+      await supabase.from('person').upsert(legacyTypoPayload);
     } catch {}
   }
   
@@ -577,11 +870,11 @@ async function writeRawPersonQuietly(person: Person) {
   const raw = localStorage.getItem(LOCAL_STORAGE_KEY);
   if (raw) {
     const people: Person[] = JSON.parse(raw);
-    const existingIndex = people.findIndex(p => p.id === person.id);
+    const existingIndex = people.findIndex(p => p.id === normalizedPerson.id);
     if (existingIndex > -1) {
-      people[existingIndex] = person;
+      people[existingIndex] = normalizedPerson;
     } else {
-      people.push(person);
+      people.push(normalizedPerson);
     }
     localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(people));
   }
@@ -589,9 +882,21 @@ async function writeRawPersonQuietly(person: Person) {
 
 // Fetch helper from local storage purely to prevent recursive loops
 async function getRawPeopleListOnly(): Promise<Person[]> {
+  if (supabase) {
+    try {
+      const { data, error } = await supabase
+        .from('person')
+        .select('*');
+
+      if (!error && data) {
+        return data.map(mapPersonFromDb);
+      }
+    } catch {}
+  }
+
   initLocalStorage();
   const raw = localStorage.getItem(LOCAL_STORAGE_KEY);
-  return raw ? JSON.parse(raw) : [];
+  return raw ? (JSON.parse(raw) as Person[]).map(normalizePersonRecord) : [];
 }
 
 // Assist user with automatic seeding of their live Supabase instance
@@ -599,19 +904,24 @@ async function seedSupabaseTable(peopleList: Person[]) {
   if (!supabase) return;
   try {
     // Prep payloads
-    const payloads = peopleList.map(person => ({
+    const payloads = peopleList.map(person => {
+      const normalizedPerson = normalizePersonRecord(person);
+      return ({
       id: person.id,
       name: person.name,
       gender: person.gender,
       dob: person.dob,
+      dod: person.dod,
       notes: person.notes,
       birthplace: person.birthPlace || '',
       occupation: person.occupation || '',
       fatherid: person.fatherid,
       motherid: person.motherid,
-      spouseid: person.spouseid,
+      spouseid: normalizedPerson.spouseid,
+      spouses: normalizedPerson.spouses,
       photourl: person.photourl
-    }));
+    });
+    });
 
     const { error } = await supabase
       .from('person')
@@ -620,19 +930,24 @@ async function seedSupabaseTable(peopleList: Person[]) {
     if (error) {
       console.warn('Seeding failed with flat layout, trying alternative snake_case naming:', error.message);
       // Try with snake layout
-      const snakePayloads = peopleList.map(person => ({
+      const snakePayloads = peopleList.map(person => {
+        const normalizedPerson = normalizePersonRecord(person);
+        return ({
         id: person.id,
         name: person.name,
         gender: person.gender,
         dob: person.dob,
+        date_of_death: person.dod,
         notes: person.notes,
         birth_place: person.birthPlace || '',
         occupation: person.occupation || '',
         father_id: person.fatherid,
         mother_id: person.motherid,
-        spouse_id: person.spouseid,
+        spouse_id: normalizedPerson.spouseid,
+        spouse_relations: normalizedPerson.spouses,
         photo_url: person.photourl
-      }));
+      });
+      });
       await supabase.from('person').upsert(snakePayloads);
     }
   } catch (err) {
@@ -652,12 +967,16 @@ create table if not exists person (
   motherid text references person(id) on delete set null,
   spouseid text references person(id) on delete set null,
   dob text,
+  dod text,
   photourl text,
   notes text,
   birthplace text,
   occupation text,
   created_at timestamp with time zone default timezone('utc'::text, now()) not null
 );
+
+alter table person add column if not exists dod text;
+alter table person add column if not exists spouses jsonb not null default '[]'::jsonb;
 
 -- Enable Row Level Security (RLS)
 alter table person enable row level security;
@@ -667,5 +986,32 @@ create policy "Allow everyone to read" on person for select using (true);
 create policy "Allow everyone to insert" on person for insert with check (true);
 create policy "Allow everyone to update" on person for update using (true);
 create policy "Allow everyone to delete" on person for delete using (true);
+
+-- SQL to set up the "${photoBucketName}" photo bucket and public test policies:
+insert into storage.buckets (id, name, public)
+values ('${photoBucketName}', '${photoBucketName}', true)
+on conflict (id) do update set public = true;
+
+drop policy if exists "Allow public photo read" on storage.objects;
+drop policy if exists "Allow public photo upload" on storage.objects;
+drop policy if exists "Allow public photo update" on storage.objects;
+drop policy if exists "Allow public photo delete" on storage.objects;
+
+create policy "Allow public photo read"
+on storage.objects for select
+using (bucket_id = '${photoBucketName}');
+
+create policy "Allow public photo upload"
+on storage.objects for insert
+with check (bucket_id = '${photoBucketName}');
+
+create policy "Allow public photo update"
+on storage.objects for update
+using (bucket_id = '${photoBucketName}')
+with check (bucket_id = '${photoBucketName}');
+
+create policy "Allow public photo delete"
+on storage.objects for delete
+using (bucket_id = '${photoBucketName}');
 `;
 }

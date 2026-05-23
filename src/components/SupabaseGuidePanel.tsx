@@ -93,11 +93,11 @@ export default function SupabaseGuidePanel({ isOpen, onClose }: SupabaseGuidePan
     <>
       {/* Dim backdrop */}
       <div 
-        className="fixed inset-0 bg-stone-900/60 backdrop-blur-xs z-55 cursor-pointer"
+        className="fixed inset-0 bg-stone-900/60 backdrop-blur-xs z-[200] cursor-pointer"
         onClick={onClose}
       />
 
-      <div className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 max-w-sm w-[92vw] sm:w-112 bg-stone-950 border border-stone-800 text-stone-300 rounded-2xl shadow-2xl p-4.5 sm:p-5 z-55 space-y-4 font-sans text-xs flex flex-col transition-all duration-300 max-h-[90vh] overflow-y-auto">
+      <div className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 max-w-sm w-[92vw] sm:w-112 bg-stone-950 border border-stone-800 text-stone-300 rounded-2xl shadow-2xl p-4.5 sm:p-5 z-[201] space-y-4 font-sans text-xs flex flex-col transition-all duration-300 max-h-[90vh] overflow-y-auto">
         
         {/* Header */}
         <div className="flex items-center justify-between pb-2 border-b border-stone-800 shrink-0">
@@ -162,7 +162,7 @@ export default function SupabaseGuidePanel({ isOpen, onClose }: SupabaseGuidePan
         <div className="flex items-center justify-between">
           <span className="text-[10px] font-bold tracking-wider text-slate-400 uppercase flex items-center gap-1">
             <Terminal className="w-3.5 h-3.5 text-indigo-400" />
-            Person Table Schema SQL
+            Supabase Setup SQL
           </span>
           <button
             onClick={handleCopy}
