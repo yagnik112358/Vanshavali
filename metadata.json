@@ -1,0 +1,6 @@
+{
+  "name": "Vanshavali",
+  "description": "A mobile-friendly interactive Vanshavali editor and visualizer using Supabase and React Flow.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
