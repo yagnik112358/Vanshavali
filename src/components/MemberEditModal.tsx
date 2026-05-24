@@ -592,7 +592,7 @@ export default function MemberEditModal({
                 className="bg-[var(--color-brand)] hover:bg-[var(--color-brand-dark)] text-white font-bold py-2 px-5 rounded-full text-xs flex items-center gap-1.5 shadow-sm hover:shadow-md transition-all cursor-pointer"
               >
                 <Save className="w-3.5 h-3.5" />
-                {uploadingPhoto ? 'Uploading Photo...' : 'Preserve Record'}
+                {uploadingPhoto ? 'Uploading Photo...' : 'Save'}
               </button>
             </div>
           </div>

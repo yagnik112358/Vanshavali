@@ -61,21 +61,21 @@ export const FamilyMemberNode = memo(({ data }: FamilyMemberNodeProps) => {
   const genderConfigs = {
     male: {
       accentBorder: 'border-l-stone-600',
-      cardBg: 'bg-white',
+      cardBg: 'family-node-card family-node-male bg-white',
       avatarBg: 'bg-stone-100 text-stone-800 border-stone-200',
       badgeClass: 'bg-stone-50 text-stone-800 border-stone-100',
       genderLabel: 'Male',
     },
     female: {
       accentBorder: 'border-l-[#be185d]',
-      cardBg: 'bg-[#fff7fb]',
+      cardBg: 'family-node-card family-node-female bg-[#fff7fb]',
       avatarBg: 'bg-[var(--color-brand-light)] text-[var(--color-brand)] border-[var(--color-brand-border)]',
       badgeClass: 'bg-[#fde6f2] text-[#9d174d] border-[#f9a8d4]',
       genderLabel: 'Female',
     },
     other: {
       accentBorder: 'border-l-slate-400',
-      cardBg: 'bg-white',
+      cardBg: 'family-node-card family-node-other bg-white',
       avatarBg: 'bg-slate-100 text-slate-800 border-slate-200',
       badgeClass: 'bg-slate-50 text-slate-800 border-slate-100',
       genderLabel: 'Non-Binary',

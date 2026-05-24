@@ -3,22 +3,23 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   ReactFlow,
   ReactFlowProvider,
   Background,
   Controls,
-  useNodesState,
-  useEdgesState,
   useReactFlow,
-  Panel,
+  getViewportForBounds,
   ConnectionLineType,
   MiniMap
 } from '@xyflow/react';
+import type { Node } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
+import { toPng } from 'html-to-image';
+import jsPDF from 'jspdf';
 
-import { Person, Gender } from './types';
+import { Person } from './types';
 import { getPeople, savePerson, deletePerson, isSupabaseConnected, uploadPersonPhoto } from './lib/db';
 import { buildFamilyTreeLayout } from './lib/layout';
 import { FamilyMemberNode } from './components/FamilyMemberNode';
@@ -32,21 +33,16 @@ import {
   Plus,
   Search,
   Users,
-  Database,
   Grid,
-  Heart,
-  Calendar,
-  Layers,
-  Sparkles,
-  HelpCircle,
   Eye,
-  Trash2,
   RefreshCw,
-  UserPlus,
   Minimize2,
   Bookmark,
   Lock,
-  Unlock
+  Unlock,
+  Download,
+  Moon,
+  Sun
 } from 'lucide-react';
 
 const nodeTypes = {
@@ -57,15 +53,76 @@ const edgeTypes = {
   familyRelation: FamilyRelationEdge,
 };
 
+type AppScreen = 'tree' | 'list' | 'profile' | 'edit' | 'db' | 'lock';
+type ThemeMode = 'light' | 'dark';
+
+const APP_HISTORY_STATE_KEY = 'familyTreeScreen';
+const EXPORT_NODE_WIDTH = 280;
+const EXPORT_NODE_HEIGHT = 150;
+const EXPORT_PADDING = 240;
+
+interface TreeExportButtonProps {
+  isExporting: boolean;
+  isDisabled: boolean;
+  onExport: () => void;
+  label?: string;
+}
+
+function TreeExportButton({ isExporting, isDisabled, onExport, label = 'Download PDF' }: TreeExportButtonProps) {
+  return (
+    <button
+      onClick={onExport}
+      disabled={isDisabled}
+      className="tree-export-button bg-white disabled:opacity-45 disabled:cursor-not-allowed text-[var(--color-brand)] border border-[var(--color-brand-border)] px-3 py-2 rounded-full text-[11px] font-bold hover:bg-[var(--color-brand-light)] transition-all shrink-0 flex items-center justify-center gap-1 cursor-pointer shadow-md"
+      title="Export open tree canvas as PDF"
+    >
+      <Download className="w-3.5 h-3.5" />
+      <span>{isExporting ? 'Exporting...' : label}</span>
+    </button>
+  );
+}
+
+function getFallbackNodeBounds(nodes: Node[]) {
+  const minX = Math.min(...nodes.map(node => node.position.x));
+  const minY = Math.min(...nodes.map(node => node.position.y));
+  const maxX = Math.max(...nodes.map(node => node.position.x + EXPORT_NODE_WIDTH));
+  const maxY = Math.max(...nodes.map(node => node.position.y + EXPORT_NODE_HEIGHT));
+
+  return {
+    x: minX,
+    y: minY,
+    width: maxX - minX,
+    height: maxY - minY,
+  };
+}
+
+function getFamilyPdfFileName(centerPerson: Person | undefined): string {
+  const baseName = centerPerson?.name?.trim() || 'Bharadwa';
+  const safeName = baseName
+    .replace(/[^\p{L}\p{N}_-]+/gu, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '') || 'Bharadwa';
+
+  return `${safeName}_family.pdf`;
+}
+
 // Internal Workspace Dashboard (requires ReactFlowProvider)
 function FamilyTreeWorkspace() {
-  const { fitView, zoomIn, zoomOut } = useReactFlow();
+  const { fitView, zoomIn, zoomOut, getNodesBounds } = useReactFlow();
+  const treeCanvasRef = useRef<HTMLDivElement>(null);
+  const activeScreenRef = useRef<AppScreen>('tree');
+  const suppressNextHistoryPushRef = useRef(false);
+  const appHistoryDepthRef = useRef(0);
 
   // Primary states
   const [people, setPeople] = useState<Person[]>([]);
   const [loading, setLoading] = useState(true);
   const [viewMode, setViewMode] = useState<'tree' | 'list'>('tree');
   const [searchQuery, setSearchQuery] = useState('');
+  const [isExportingPdf, setIsExportingPdf] = useState(false);
+  const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
+    return localStorage.getItem('family_tree_theme_mode_v1') === 'dark' ? 'dark' : 'light';
+  });
   
   // Filtering & Focus parameters
   const [focusPersonId, setFocusPersonId] = useState<string | null>(null);
@@ -99,6 +156,7 @@ function FamilyTreeWorkspace() {
     if (pin === passcode) {
       setIsUnlocked(true);
       localStorage.setItem('family_tree_is_unlocked_v1', 'true');
+      setIsLockModalOpen(false);
       if (pendingEditPerson) {
         setIsProfileOpen(false);
         setIsDbOpen(false);
@@ -122,6 +180,148 @@ function FamilyTreeWorkspace() {
   const handleUpdatePasscode = (newPin: string) => {
     setPasscode(newPin);
     localStorage.setItem('family_tree_passcode_v1', newPin);
+  };
+
+  const closeTopScreenState = useCallback(() => {
+    const screen = activeScreenRef.current;
+
+    if (screen === 'lock') {
+      setIsLockModalOpen(false);
+      setPendingEditPerson(null);
+      return true;
+    }
+
+    if (screen === 'edit') {
+      setIsEditOpen(false);
+      setEditPerson(null);
+      setRelationPreset(null);
+      return true;
+    }
+
+    if (screen === 'profile') {
+      setIsProfileOpen(false);
+      setSelectedPersonForProfile(null);
+      return true;
+    }
+
+    if (screen === 'db') {
+      setIsDbOpen(false);
+      return true;
+    }
+
+    if (screen === 'list') {
+      setViewMode('tree');
+      return true;
+    }
+
+    return false;
+  }, []);
+
+  const requestAppBack = useCallback(() => {
+    if (appHistoryDepthRef.current > 0) {
+      window.history.back();
+      return;
+    }
+
+    closeTopScreenState();
+  }, [closeTopScreenState]);
+
+  const showTreeView = useCallback(() => {
+    if (activeScreenRef.current === 'list' && appHistoryDepthRef.current > 0) {
+      window.history.back();
+      return;
+    }
+
+    setViewMode('tree');
+  }, []);
+
+  const showListView = useCallback(() => {
+    setViewMode('list');
+  }, []);
+
+  const handleToggleTheme = () => {
+    setThemeMode(current => (current === 'light' ? 'dark' : 'light'));
+  };
+
+  const handleExportPdf = async () => {
+    if (!treeCanvasRef.current || loading || isExportingPdf || nodes.length === 0) return;
+
+    setIsExportingPdf(true);
+    try {
+      if (viewMode !== 'tree') {
+        setViewMode('tree');
+        await new Promise(resolve => window.setTimeout(resolve, 250));
+      }
+
+      const canvasElement = treeCanvasRef.current;
+      const viewportElement = canvasElement.querySelector('.react-flow__viewport') as HTMLElement | null;
+      if (!viewportElement) {
+        throw new Error('React Flow viewport was not ready for export.');
+      }
+
+      const measuredBounds = getNodesBounds(nodes.map(node => node.id));
+      const bounds = measuredBounds.width > 0 && measuredBounds.height > 0
+        ? measuredBounds
+        : getFallbackNodeBounds(nodes);
+      const paddedWidth = bounds.width + EXPORT_PADDING * 2;
+      const paddedHeight = bounds.height + EXPORT_PADDING * 2;
+      const exportWidth = Math.round(Math.min(Math.max(paddedWidth, 1600), 3200));
+      const exportHeight = Math.round(Math.min(Math.max(paddedHeight, 1000), 3200));
+      const exportViewport = getViewportForBounds(
+        bounds,
+        exportWidth,
+        exportHeight,
+        0.05,
+        2,
+        0.08,
+      );
+
+      const imageData = await toPng(viewportElement, {
+        backgroundColor: themeMode === 'dark' ? '#1e1e1a' : '#fdfdfb',
+        cacheBust: true,
+        width: exportWidth,
+        height: exportHeight,
+        pixelRatio: 2,
+        style: {
+          width: `${exportWidth}px`,
+          height: `${exportHeight}px`,
+          transform: `translate(${exportViewport.x}px, ${exportViewport.y}px) scale(${exportViewport.zoom})`,
+        },
+      });
+
+      const pdf = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' });
+      const pageWidth = pdf.internal.pageSize.getWidth();
+      const pageHeight = pdf.internal.pageSize.getHeight();
+      const margin = 24;
+      const availableWidth = pageWidth - margin * 2;
+      const availableHeight = pageHeight - margin * 2;
+      const imageRatio = exportWidth / exportHeight;
+      let imageWidth = availableWidth;
+      let imageHeight = imageWidth / imageRatio;
+
+      if (imageHeight > availableHeight) {
+        imageHeight = availableHeight;
+        imageWidth = imageHeight * imageRatio;
+      }
+
+      pdf.addImage(
+        imageData,
+        'PNG',
+        (pageWidth - imageWidth) / 2,
+        (pageHeight - imageHeight) / 2,
+        imageWidth,
+        imageHeight,
+      );
+      const centerPerson = focusPersonId
+        ? people.find(person => person.id === focusPersonId)
+        : undefined;
+      pdf.save(getFamilyPdfFileName(centerPerson));
+    } catch (err) {
+      console.error('Error exporting family tree PDF:', err);
+      alert('Failed to export PDF. Try again after photos finish loading.');
+    } finally {
+      setIsExportingPdf(false);
+    }
   };
 
   // Fetch people from database
@@ -175,6 +375,9 @@ function FamilyTreeWorkspace() {
       setIsEditOpen(false);
       setEditPerson(null);
       setRelationPreset(null);
+      if (activeScreenRef.current === 'edit' && appHistoryDepthRef.current > 0) {
+        window.history.back();
+      }
 
       // If viewing active sheet, update data
       if (selectedPersonForProfile && selectedPersonForProfile.id === result.id) {
@@ -208,6 +411,9 @@ function FamilyTreeWorkspace() {
 
       setIsEditOpen(false);
       setEditPerson(null);
+      if (activeScreenRef.current === 'edit' && appHistoryDepthRef.current > 0) {
+        window.history.back();
+      }
     } catch (err) {
       console.error('Error deleting person:', err);
     }
@@ -324,6 +530,70 @@ function FamilyTreeWorkspace() {
     return { nodes: finalNodes, edges: layout.edges };
   }, [people, focusPersonId]);
 
+  const activeScreen = useMemo<AppScreen>(() => {
+    if (isLockModalOpen) return 'lock';
+    if (isEditOpen) return 'edit';
+    if (isProfileOpen) return 'profile';
+    if (isDbOpen) return 'db';
+    if (viewMode === 'list') return 'list';
+    return 'tree';
+  }, [isLockModalOpen, isEditOpen, isProfileOpen, isDbOpen, viewMode]);
+  activeScreenRef.current = activeScreen;
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = themeMode;
+    document.documentElement.style.colorScheme = themeMode;
+    localStorage.setItem('family_tree_theme_mode_v1', themeMode);
+  }, [themeMode]);
+
+  useEffect(() => {
+    activeScreenRef.current = activeScreen;
+  }, [activeScreen]);
+
+  useEffect(() => {
+    const handlePopState = () => {
+      if (appHistoryDepthRef.current > 0) {
+        appHistoryDepthRef.current -= 1;
+      }
+
+      if (activeScreenRef.current !== 'tree') {
+        suppressNextHistoryPushRef.current = true;
+        closeTopScreenState();
+      }
+    };
+
+    const initialState = window.history.state;
+    if (!initialState || initialState[APP_HISTORY_STATE_KEY] !== 'tree') {
+      window.history.replaceState(
+        { ...(initialState || {}), [APP_HISTORY_STATE_KEY]: 'tree' },
+        '',
+        window.location.href,
+      );
+    }
+
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, [closeTopScreenState]);
+
+  useEffect(() => {
+    if (suppressNextHistoryPushRef.current) {
+      suppressNextHistoryPushRef.current = false;
+      return;
+    }
+
+    if (activeScreen === 'tree') return;
+
+    const currentScreen = window.history.state?.[APP_HISTORY_STATE_KEY];
+    if (currentScreen === activeScreen) return;
+
+    window.history.pushState(
+      { ...(window.history.state || {}), [APP_HISTORY_STATE_KEY]: activeScreen },
+      '',
+      window.location.href,
+    );
+    appHistoryDepthRef.current += 1;
+  }, [activeScreen]);
+
   useEffect(() => {
     if (!pendingTreeFit || viewMode !== 'tree' || loading) return;
 
@@ -368,7 +638,7 @@ function FamilyTreeWorkspace() {
   }, [people]);
 
   return (
-    <div className="h-screen bg-[#f5f5f0] text-stone-900 flex flex-col font-sans antialiased overflow-hidden">
+    <div data-theme={themeMode} className="app-shell h-screen bg-[#f5f5f0] text-stone-900 flex flex-col font-sans antialiased overflow-hidden">
       
       {/* 1. Header Toolbar */}
       <header className="bg-white/70 backdrop-blur-md border-b border-[var(--color-brand-border)] h-16 shrink-0 flex items-center justify-between px-3 sm:px-8 shadow-xs z-10">
@@ -447,7 +717,7 @@ function FamilyTreeWorkspace() {
           {/* View Toggles (Graph vs Listing Table) */}
           <div className="bg-[#f5f5f0] p-0.5 sm:p-1 rounded-full border border-[var(--color-brand-border)] flex items-center gap-0.5">
             <button
-              onClick={() => setViewMode('tree')}
+              onClick={showTreeView}
               className={`flex items-center gap-1 px-2 py-1 sm:px-3 sm:py-1.5 rounded-full text-[11px] sm:text-xs font-bold tracking-tight cursor-pointer transition-all ${
                 viewMode === 'tree'
                   ? 'bg-white text-[var(--color-brand)] shadow-xs'
@@ -459,7 +729,7 @@ function FamilyTreeWorkspace() {
               <span className="sm:hidden text-[10px]">Tree</span>
             </button>
             <button
-              onClick={() => setViewMode('list')}
+              onClick={showListView}
               className={`flex items-center gap-1 px-2 py-1 sm:px-3 sm:py-1.5 rounded-full text-[11px] sm:text-xs font-bold tracking-tight cursor-pointer transition-all ${
                 viewMode === 'list'
                   ? 'bg-white text-[var(--color-brand)] shadow-xs'
@@ -472,10 +742,19 @@ function FamilyTreeWorkspace() {
             </button>
           </div>
 
+          <button
+            onClick={handleToggleTheme}
+            className="bg-white text-[var(--color-brand)] border border-[var(--color-brand-border)] px-2.5 py-1.5 sm:px-3 sm:py-2 rounded-full text-[11px] sm:text-xs font-bold hover:bg-[var(--color-brand-light)] transition-all shrink-0 flex items-center justify-center gap-1 cursor-pointer"
+            title={`Switch to ${themeMode === 'light' ? 'dark' : 'light'} mode`}
+          >
+            {themeMode === 'light' ? <Sun className="w-3.5 h-3.5" /> : <Moon className="w-3.5 h-3.5" />}
+            <span className="hidden lg:inline">{themeMode === 'light' ? 'Light' : 'Dark'}</span>
+          </button>
+
           {/* Lock/Unlock Authorization Badge Control */}
           <button
             onClick={() => setIsLockModalOpen(true)}
-            className={`flex items-center gap-1 px-2.5 py-1.5 rounded-full text-xs font-bold border transition-all cursor-pointer ${
+            className={`editor-mode-button ${isUnlocked ? 'editor-mode-unlocked' : 'editor-mode-locked'} flex items-center gap-1 px-2.5 py-1.5 rounded-full text-xs font-bold border transition-all cursor-pointer ${
               isUnlocked
                 ? 'bg-emerald-50 border-emerald-200 text-emerald-800 hover:bg-emerald-100/70'
                 : 'bg-amber-50 border-amber-200 text-amber-800 hover:bg-amber-100/70'
@@ -573,7 +852,7 @@ function FamilyTreeWorkspace() {
 
         {/* Alternate Screen 1: The Interactive Graph Diagram */}
         {viewMode === 'tree' ? (
-          <div className="flex-1 relative h-full w-full bg-[#fdfdfb]">
+            <div className="flex-1 relative h-full w-full bg-[#fdfdfb]">
             
             {/* Control HUD Panel in Upper Corner */}
             <div className="absolute top-4 right-4 z-10 bg-white/90 backdrop-blur-md rounded-2xl shadow-md border border-[var(--color-brand-border)] p-4 w-[280px] hidden sm:block space-y-4">
@@ -611,6 +890,12 @@ function FamilyTreeWorkspace() {
                   <p className="text-[8px] text-[var(--color-brand-muted)] font-black uppercase leading-normal">People</p>
                 </div>
               </div>
+
+              <TreeExportButton
+                isExporting={isExportingPdf}
+                isDisabled={loading || isExportingPdf}
+                onExport={handleExportPdf}
+              />
             </div>
  
             {/* Micro HUD for mobile (floating at top-center/top-left) */}
@@ -628,11 +913,16 @@ function FamilyTreeWorkspace() {
                   ))}
                 </select>
               </div>
+              <TreeExportButton
+                isExporting={isExportingPdf}
+                isDisabled={loading || isExportingPdf}
+                onExport={handleExportPdf}
+              />
             </div>
  
             {/* Quick action buttons block relative to focus details - Artistic Flair styled */}
             {focusPersonId && (
-              <div className="absolute bottom-4 left-1/2 -translate-x-1/2 sm:translate-x-0 sm:left-4 z-25 bg-[var(--color-brand)] shadow-xl border border-[var(--color-brand-dark)] rounded-xl sm:rounded-full px-3.5 py-2 sm:px-4.5 sm:py-2 text-white flex flex-col sm:flex-row items-center gap-2 sm:gap-4 text-xs font-bold ring-4 ring-white/10 max-w-[94vw] w-max select-none">
+              <div className="selected-actions-panel absolute bottom-4 left-1/2 -translate-x-1/2 sm:translate-x-0 sm:left-4 z-25 bg-[var(--color-brand)] shadow-xl border border-[var(--color-brand-dark)] rounded-xl sm:rounded-full px-3.5 py-2 sm:px-4.5 sm:py-2 text-white flex flex-col sm:flex-row items-center gap-2 sm:gap-4 text-xs font-bold ring-4 ring-white/10 max-w-[94vw] w-max select-none">
                 <span className="text-white font-serif italic text-[11px] sm:text-xs truncate max-w-[200px] sm:max-w-xs block leading-none">
                   Selected: {people.find(p => p.id === focusPersonId)?.name}
                 </span>
@@ -688,32 +978,34 @@ function FamilyTreeWorkspace() {
             </div>
 
             {/* React Flow Core Drawing Board */}
-            <ReactFlow
-              nodes={nodes}
-              edges={edges}
-              nodeTypes={nodeTypes}
-              edgeTypes={edgeTypes}
-              connectionLineType={ConnectionLineType.SmoothStep}
-              fitView
-              minZoom={0.1}
-              maxZoom={1.5}
-              proOptions={{ hideAttribution: true }}
-            >
-              <Background color="#5A5A40" gap={24} size={1.2} style={{ opacity: 0.15 }} />
-              
-              <Controls showInteractive={false} className="sm:hidden" />
-              
-              <MiniMap 
-                nodeStrokeColor={(n) => '#e2e8f0'} 
-                nodeColor={(n) => {
-                  const p = (n.data as any)?.person as Person;
-                  if (p?.gender === 'female') return '#f3efec';
-                  if (p?.gender === 'male') return '#edf0ec';
-                  return '#f5f5f0';
-                }}
-                className="hidden sm:block shadow-lg border border-[var(--color-brand-border)] rounded-2xl overflow-hidden bg-white/85" 
-              />
-            </ReactFlow>
+            <div ref={treeCanvasRef} className="absolute inset-0 bg-[#fdfdfb]">
+              <ReactFlow
+                nodes={nodes}
+                edges={edges}
+                nodeTypes={nodeTypes}
+                edgeTypes={edgeTypes}
+                connectionLineType={ConnectionLineType.SmoothStep}
+                fitView
+                minZoom={0.1}
+                maxZoom={1.5}
+                proOptions={{ hideAttribution: true }}
+              >
+                <Background color="#5A5A40" gap={24} size={1.2} style={{ opacity: 0.15 }} />
+                
+                <Controls showInteractive={false} className="sm:hidden" />
+                
+                <MiniMap 
+                  nodeStrokeColor={(n) => '#e2e8f0'} 
+                  nodeColor={(n) => {
+                    const p = (n.data as any)?.person as Person;
+                    if (p?.gender === 'female') return '#f3efec';
+                    if (p?.gender === 'male') return '#edf0ec';
+                    return '#f5f5f0';
+                  }}
+                  className="hidden sm:block shadow-lg border border-[var(--color-brand-border)] rounded-2xl overflow-hidden bg-white/85" 
+                />
+              </ReactFlow>
+            </div>
           </div>
         ) : (
           
@@ -808,7 +1100,7 @@ function FamilyTreeWorkspace() {
                         <div className="border-t border-[#f5f5f0] mt-4 pt-3 flex items-center justify-between">
                           <button
                             onClick={() => {
-                              setViewMode('tree');
+                              showTreeView();
                               handleFocusSelect(p.id);
                             }}
                             className="text-[10px] text-[var(--color-brand)] hover:underline flex items-center gap-0.5 font-serif font-bold italic cursor-pointer"
@@ -843,17 +1135,14 @@ function FamilyTreeWorkspace() {
         {/* 3. Database Guide slide-down console modal */}
         <SupabaseGuidePanel
           isOpen={isDbOpen}
-          onClose={() => setIsDbOpen(false)}
+          onClose={requestAppBack}
         />
 
         {/* 4. Profiles view sheet side dialog */}
         <MemberProfileSheet
           isOpen={isProfileOpen}
           person={selectedPersonForProfile}
-          onClose={() => {
-            setIsProfileOpen(false);
-            setSelectedPersonForProfile(null);
-          }}
+          onClose={requestAppBack}
           allPeople={people}
           onFocusMember={(id) => {
             handleFocusSelect(id);
@@ -875,11 +1164,7 @@ function FamilyTreeWorkspace() {
         <MemberEditModal
           isOpen={isEditOpen}
           person={editPerson}
-          onClose={() => {
-            setIsEditOpen(false);
-            setEditPerson(null);
-            setRelationPreset(null);
-          }}
+          onClose={requestAppBack}
           onSave={handleSavePerson}
           onDelete={handleDeletePerson}
           allPeople={people}
@@ -889,7 +1174,7 @@ function FamilyTreeWorkspace() {
         {/* 6. Security Pin/Passcode Lock Modal */}
         <EditLockModal
           isOpen={isLockModalOpen}
-          onClose={() => setIsLockModalOpen(false)}
+          onClose={requestAppBack}
           isUnlocked={isUnlocked}
           onUnlock={handleUnlock}
           onLock={handleLock}
