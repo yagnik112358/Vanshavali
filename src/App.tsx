@@ -10,16 +10,13 @@ import {
   Background,
   Controls,
   useReactFlow,
-  getViewportForBounds,
   ConnectionLineType,
   MiniMap
 } from '@xyflow/react';
-import type { Node } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
-import { toPng } from 'html-to-image';
 import jsPDF from 'jspdf';
 
-import { Person } from './types';
+import { Person, SpouseRelation } from './types';
 import { getPeople, savePerson, deletePerson, isSupabaseConnected, uploadPersonPhoto } from './lib/db';
 import { buildFamilyTreeLayout } from './lib/layout';
 import { FamilyMemberNode } from './components/FamilyMemberNode';
@@ -57,9 +54,7 @@ type AppScreen = 'tree' | 'list' | 'profile' | 'edit' | 'db' | 'lock';
 type ThemeMode = 'light' | 'dark';
 
 const APP_HISTORY_STATE_KEY = 'familyTreeScreen';
-const EXPORT_NODE_WIDTH = 280;
-const EXPORT_NODE_HEIGHT = 150;
-const EXPORT_PADDING = 240;
+const PDF_MARGIN = 42;
 
 interface TreeExportButtonProps {
   isExporting: boolean;
@@ -82,20 +77,6 @@ function TreeExportButton({ isExporting, isDisabled, onExport, label = 'Download
   );
 }
 
-function getFallbackNodeBounds(nodes: Node[]) {
-  const minX = Math.min(...nodes.map(node => node.position.x));
-  const minY = Math.min(...nodes.map(node => node.position.y));
-  const maxX = Math.max(...nodes.map(node => node.position.x + EXPORT_NODE_WIDTH));
-  const maxY = Math.max(...nodes.map(node => node.position.y + EXPORT_NODE_HEIGHT));
-
-  return {
-    x: minX,
-    y: minY,
-    width: maxX - minX,
-    height: maxY - minY,
-  };
-}
-
 function getFamilyPdfFileName(centerPerson: Person | undefined): string {
   const baseName = centerPerson?.name?.trim() || 'Bharadwa';
   const safeName = baseName
@@ -106,10 +87,131 @@ function getFamilyPdfFileName(centerPerson: Person | undefined): string {
   return `${safeName}_family.pdf`;
 }
 
+function getYear(value: string | null | undefined): string {
+  return value ? value.split('-')[0] : '';
+}
+
+function getLifeSpan(person: Person): string {
+  const birthYear = getYear(person.dob) || 'Unknown';
+  const deathYear = person.dod ? getYear(person.dod) : 'Present';
+  return `${birthYear} - ${deathYear}`;
+}
+
+function getPersonName(peopleById: Map<string, Person>, id: string | null | undefined): string {
+  if (!id) return '-';
+  return peopleById.get(id)?.name || '-';
+}
+
+function getSpouseRelations(person: Person): SpouseRelation[] {
+  const relationMap = new Map<string, SpouseRelation>();
+  (person.spouses || []).forEach(relation => {
+    if (!relation.personId) return;
+    relationMap.set(relation.personId, {
+      personId: relation.personId,
+      status: relation.status || 'current',
+      startDate: relation.startDate || null,
+      endDate: relation.endDate || null,
+      childrenIds: relation.childrenIds || [],
+    });
+  });
+
+  if (person.spouseid && !relationMap.has(person.spouseid)) {
+    relationMap.set(person.spouseid, {
+      personId: person.spouseid,
+      status: 'current',
+      startDate: null,
+      endDate: null,
+      childrenIds: [],
+    });
+  }
+
+  return Array.from(relationMap.values());
+}
+
+function hasKnownParents(person: Person, peopleById: Map<string, Person>): boolean {
+  return (!!person.fatherid && peopleById.has(person.fatherid)) ||
+    (!!person.motherid && peopleById.has(person.motherid));
+}
+
+function getKnownSpouses(person: Person, peopleById: Map<string, Person>): Person[] {
+  return getSpouseRelations(person)
+    .map(relation => peopleById.get(relation.personId))
+    .filter((spouse): spouse is Person => !!spouse);
+}
+
+function isParentlessFemaleSpouse(person: Person, peopleById: Map<string, Person>): boolean {
+  return person.gender === 'female' &&
+    !hasKnownParents(person, peopleById) &&
+    getKnownSpouses(person, peopleById).length > 0;
+}
+
+function isDefaultRootCandidate(person: Person, peopleById: Map<string, Person>): boolean {
+  return !hasKnownParents(person, peopleById) && !isParentlessFemaleSpouse(person, peopleById);
+}
+
+function getDirectoryPeopleForExport(
+  allPeople: Person[],
+  centerPerson: Person | undefined,
+  peopleById: Map<string, Person>,
+): Person[] {
+  if (!centerPerson) return allPeople;
+
+  const includedIds = new Set<string>([centerPerson.id]);
+  const queue = [centerPerson.id];
+
+  getKnownSpouses(centerPerson, peopleById).forEach(spouse => includedIds.add(spouse.id));
+
+  while (queue.length > 0) {
+    const parentId = queue.shift()!;
+    allPeople
+      .filter(person => person.fatherid === parentId || person.motherid === parentId)
+      .forEach(child => {
+        if (!includedIds.has(child.id)) {
+          includedIds.add(child.id);
+          queue.push(child.id);
+        }
+
+        getKnownSpouses(child, peopleById).forEach(spouse => includedIds.add(spouse.id));
+      });
+  }
+
+  return allPeople.filter(person => includedIds.has(person.id));
+}
+
+function getPersonGeneration(
+  person: Person,
+  peopleById: Map<string, Person>,
+  cache: Map<string, number>,
+  visiting = new Set<string>(),
+): number {
+  if (cache.has(person.id)) return cache.get(person.id)!;
+  if (visiting.has(person.id)) return 1;
+
+  visiting.add(person.id);
+  const parents = [person.fatherid, person.motherid]
+    .filter((id): id is string => !!id && peopleById.has(id))
+    .map(id => peopleById.get(id)!);
+
+  let generation: number;
+  if (parents.length > 0) {
+    generation = Math.max(...parents.map(parent => getPersonGeneration(parent, peopleById, cache, visiting))) + 1;
+  } else if (isParentlessFemaleSpouse(person, peopleById)) {
+    const spouseGenerations = getKnownSpouses(person, peopleById)
+      .filter(spouse => !visiting.has(spouse.id))
+      .map(spouse => getPersonGeneration(spouse, peopleById, cache, visiting));
+    generation = spouseGenerations.length > 0 ? Math.min(...spouseGenerations) : 1;
+  } else {
+    generation = 1;
+  }
+
+  visiting.delete(person.id);
+  cache.set(person.id, generation);
+  return generation;
+}
+
 // Internal Workspace Dashboard (requires ReactFlowProvider)
 function FamilyTreeWorkspace() {
-  const { fitView, zoomIn, zoomOut, getNodesBounds } = useReactFlow();
-  const treeCanvasRef = useRef<HTMLDivElement>(null);
+  const { fitView, zoomIn, zoomOut } = useReactFlow();
   const activeScreenRef = useRef<AppScreen>('tree');
   const suppressNextHistoryPushRef = useRef(false);
   const appHistoryDepthRef = useRef(0);
@@ -244,81 +346,136 @@ function FamilyTreeWorkspace() {
   };
 
   const handleExportPdf = async () => {
-    if (!treeCanvasRef.current || loading || isExportingPdf || nodes.length === 0) return;
+    if (loading || isExportingPdf || people.length === 0) return;
 
     setIsExportingPdf(true);
     try {
-      if (viewMode !== 'tree') {
-        setViewMode('tree');
-        await new Promise(resolve => window.setTimeout(resolve, 250));
-      }
-
-      const canvasElement = treeCanvasRef.current;
-      const viewportElement = canvasElement.querySelector('.react-flow__viewport') as HTMLElement | null;
-      if (!viewportElement) {
-        throw new Error('React Flow viewport was not ready for export.');
-      }
-
-      const measuredBounds = getNodesBounds(nodes.map(node => node.id));
-      const bounds = measuredBounds.width > 0 && measuredBounds.height > 0
-        ? measuredBounds
-        : getFallbackNodeBounds(nodes);
-      const paddedWidth = bounds.width + EXPORT_PADDING * 2;
-      const paddedHeight = bounds.height + EXPORT_PADDING * 2;
-      const exportWidth = Math.round(Math.min(Math.max(paddedWidth, 1600), 3200));
-      const exportHeight = Math.round(Math.min(Math.max(paddedHeight, 1000), 3200));
-      const exportViewport = getViewportForBounds(
-        bounds,
-        exportWidth,
-        exportHeight,
-        0.05,
-        2,
-        0.08,
-      );
-
-      const imageData = await toPng(viewportElement, {
-        backgroundColor: themeMode === 'dark' ? '#1e1e1a' : '#fdfdfb',
-        cacheBust: true,
-        width: exportWidth,
-        height: exportHeight,
-        pixelRatio: 2,
-        style: {
-          width: `${exportWidth}px`,
-          height: `${exportHeight}px`,
-          transform: `translate(${exportViewport.x}px, ${exportViewport.y}px) scale(${exportViewport.zoom})`,
-        },
-      });
-
-      const pdf = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' });
-      const pageWidth = pdf.internal.pageSize.getWidth();
-      const pageHeight = pdf.internal.pageSize.getHeight();
-      const margin = 24;
-      const availableWidth = pageWidth - margin * 2;
-      const availableHeight = pageHeight - margin * 2;
-      const imageRatio = exportWidth / exportHeight;
-      let imageWidth = availableWidth;
-      let imageHeight = imageWidth / imageRatio;
-
-      if (imageHeight > availableHeight) {
-        imageHeight = availableHeight;
-        imageWidth = imageHeight * imageRatio;
-      }
-
-      pdf.addImage(
-        imageData,
-        'PNG',
-        (pageWidth - imageWidth) / 2,
-        (pageHeight - imageHeight) / 2,
-        imageWidth,
-        imageHeight,
-      );
       const centerPerson = focusPersonId
         ? people.find(person => person.id === focusPersonId)
         : undefined;
+      const peopleById = new Map<string, Person>(people.map(person => [person.id, person]));
+      const exportPeople = getDirectoryPeopleForExport(people, centerPerson, peopleById);
+      const exportPeopleIds = new Set(exportPeople.map(person => person.id));
+      const generationCache = new Map<string, number>();
+      const peopleWithGeneration = exportPeople
+        .map(person => ({
+          person,
+          generation: getPersonGeneration(person, peopleById, generationCache),
+        }))
+        .sort((first, second) => {
+          if (first.generation !== second.generation) return first.generation - second.generation;
+          return first.person.name.localeCompare(second.person.name);
+        });
+      const generationGroups = peopleWithGeneration.reduce((groups, item) => {
+        const current = groups.get(item.generation) || [];
+        current.push(item.person);
+        groups.set(item.generation, current);
+        return groups;
+      }, new Map<number, Person[]>());
+
+      const pdf = new jsPDF({ orientation: 'portrait', unit: 'pt', format: 'a4' });
+      const pageWidth = pdf.internal.pageSize.getWidth();
+      const pageHeight = pdf.internal.pageSize.getHeight();
+      const contentWidth = pageWidth - PDF_MARGIN * 2;
+      let cursorY = PDF_MARGIN;
+
+      const addPageIfNeeded = (requiredHeight: number) => {
+        if (cursorY + requiredHeight <= pageHeight - PDF_MARGIN) return;
+        pdf.addPage();
+        cursorY = PDF_MARGIN;
+      };
+
+      const addLine = (
+        text: string,
+        options: { size?: number; style?: 'normal' | 'bold'; gapAfter?: number; indent?: number } = {},
+      ) => {
+        const fontSize = options.size || 9;
+        const lineHeight = fontSize + 4;
+        const x = PDF_MARGIN + (options.indent || 0);
+        const lines = pdf.splitTextToSize(text, contentWidth - (options.indent || 0));
+        addPageIfNeeded(lines.length * lineHeight + (options.gapAfter || 0));
+        pdf.setFont('helvetica', options.style || 'normal');
+        pdf.setFontSize(fontSize);
+        pdf.text(lines, x, cursorY);
+        cursorY += lines.length * lineHeight + (options.gapAfter || 0);
+      };
+
+      const addSectionTitle = (title: string) => {
+        addPageIfNeeded(34);
+        pdf.setDrawColor(90, 90, 64);
+        pdf.setLineWidth(0.8);
+        pdf.line(PDF_MARGIN, cursorY, pageWidth - PDF_MARGIN, cursorY);
+        cursorY += 14;
+        addLine(title, { size: 13, style: 'bold', gapAfter: 8 });
+      };
+
+      pdf.setTextColor(26, 26, 26);
+      addLine('Bharadwa Family Directory', { size: 22, style: 'bold', gapAfter: 8 });
+      addLine(`Scope: ${centerPerson ? `${centerPerson.name}'s descendants and spouse(s)` : 'Full Family Tree'}`, { size: 11, gapAfter: 3 });
+      addLine(`Total members included: ${exportPeople.length}`, { size: 11, gapAfter: 3 });
+      addLine(`Generated on: ${new Date().toLocaleDateString()}`, { size: 11, gapAfter: 18 });
+
+      const statsLines = [
+        `Generations: ${generationGroups.size}`,
+        `Men: ${exportPeople.filter(person => person.gender === 'male').length}`,
+        `Women: ${exportPeople.filter(person => person.gender === 'female').length}`,
+        `Other: ${exportPeople.filter(person => person.gender === 'other').length}`,
+        `Root members: ${exportPeople.filter(person => isDefaultRootCandidate(person, peopleById)).length}`,
+      ];
+      addSectionTitle('Summary');
+      statsLines.forEach(line => addLine(line, { size: 10, indent: 10, gapAfter: 2 }));
+
+      Array.from(generationGroups.entries()).forEach(([generation, generationPeople]) => {
+        addSectionTitle(`Generation ${generation}`);
+        generationPeople.forEach((person, index) => {
+          const spouseNames = getSpouseRelations(person)
+            .map(relation => {
+              const spouseName = getPersonName(peopleById, relation.personId);
+              return relation.status && relation.status !== 'current'
+                ? `${spouseName} (${relation.status})`
+                : spouseName;
+            })
+            .filter(name => name !== '-');
+          const childrenNames = exportPeople
+            .filter(candidate => exportPeopleIds.has(candidate.id) && (candidate.fatherid === person.id || candidate.motherid === person.id))
+            .map(child => child.name)
+            .sort((first, second) => first.localeCompare(second));
+
+          addPageIfNeeded(92);
+          addLine(`${index + 1}. ${person.name}`, { size: 11, style: 'bold', gapAfter: 2 });
+          addLine(`${getLifeSpan(person)} | ${person.gender}${person.occupation ? ` | ${person.occupation}` : ''}`, {
+            size: 9,
+            indent: 14,
+            gapAfter: 1,
+          });
+          addLine(`Parents: ${getPersonName(peopleById, person.fatherid)}, ${getPersonName(peopleById, person.motherid)}`, {
+            size: 9,
+            indent: 14,
+            gapAfter: 1,
+          });
+          addLine(`Spouse(s): ${spouseNames.length > 0 ? spouseNames.join(', ') : '-'}`, {
+            size: 9,
+            indent: 14,
+            gapAfter: 1,
+          });
+          addLine(`Children: ${childrenNames.length > 0 ? childrenNames.join(', ') : '-'}`, {
+            size: 9,
+            indent: 14,
+            gapAfter: person.birthPlace || person.notes ? 1 : 8,
+          });
+          if (person.birthPlace) {
+            addLine(`Birth place: ${person.birthPlace}`, { size: 9, indent: 14, gapAfter: person.notes ? 1 : 8 });
+          }
+          if (person.notes) {
+            addLine(`Notes: ${person.notes}`, { size: 9, indent: 14, gapAfter: 8 });
+          }
+        });
+      });
+
       pdf.save(getFamilyPdfFileName(centerPerson));
     } catch (err) {
-      console.error('Error exporting family tree PDF:', err);
-      alert('Failed to export PDF. Try again after photos finish loading.');
+      console.error('Error exporting family directory PDF:', err);
+      alert('Failed to export PDF. Please try again.');
     } finally {
       setIsExportingPdf(false);
     }
@@ -334,8 +491,9 @@ function FamilyTreeWorkspace() {
       
       // Select first grandparent as default focus if no focus exists
       if (data.length > 0 && !focusPersonId) {
+        const peopleById = new Map<string, Person>(data.map(person => [person.id, person]));
         // Look for someone with no parents (Family Elder / વડીલ)
-        const rootOptions = data.filter(p => !p.fatherid && !p.motherid);
+        const rootOptions = data.filter(person => isDefaultRootCandidate(person, peopleById));
         if (rootOptions.length > 0) {
           setFocusPersonId(rootOptions[0].id);
         } else {
@@ -978,7 +1136,7 @@ function FamilyTreeWorkspace() {
             </div>
 
             {/* React Flow Core Drawing Board */}
-            <div ref={treeCanvasRef} className="absolute inset-0 bg-[#fdfdfb]">
+            <div className="absolute inset-0 bg-[#fdfdfb]">
               <ReactFlow
                 nodes={nodes}
                 edges={edges}
